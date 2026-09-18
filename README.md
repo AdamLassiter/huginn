@@ -5,8 +5,9 @@
 # Huginn
 
 Huginn is a Rust rules engine with terminal and multiplayer web interfaces for
-11x11 Copenhagen hnefatafl. It supports both conventional play and the optional
-multiverse time-travel extension described in [5D-RULES.md](5D-RULES.md).
+11x11 Copenhagen hnefatafl described in [RULES.md](RULES.md). It supports both
+conventional play and the optional multiverse time-travel extension described
+in [5D-RULES.md](5D-RULES.md).
 
 ## Run
 
