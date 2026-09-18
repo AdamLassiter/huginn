@@ -1,0 +1,100 @@
+name: CI and container
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+    tags: ["v*"]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: Format, lint, and test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy,rustfmt
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Run tests
+        run: cargo test --workspace --all-targets --locked
+
+  container:
+    name: Build and publish container
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Resolve Gitea registry coordinates
+        id: registry
+        shell: bash
+        run: |
+          registry="${GITHUB_SERVER_URL#http://}"
+          registry="${registry#https://}"
+          registry="${registry%%/*}"
+          repository="${GITHUB_REPOSITORY,,}"
+          echo "registry=${registry}" >> "${GITHUB_OUTPUT}"
+          echo "image=${registry}/${repository}" >> "${GITHUB_OUTPUT}"
+
+      - name: Log in to the Gitea container registry
+        if: gitea.event_name == 'push'
+        shell: bash
+        env:
+          GITEA_TOKEN: ${{ secrets.GITEA_TOKEN }}
+          REGISTRY: ${{ steps.registry.outputs.registry }}
+        run: |
+          printf '%s' "${GITEA_TOKEN}" | docker login \
+            "${REGISTRY}" \
+            --username "${GITHUB_ACTOR}" \
+            --password-stdin
+
+      - name: Build image
+        id: build
+        shell: bash
+        env:
+          IMAGE: ${{ steps.registry.outputs.image }}
+        run: |
+          short_sha="${GITHUB_SHA:0:12}"
+          docker build \
+            --label "org.opencontainers.image.source=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}" \
+            --label "org.opencontainers.image.revision=${GITHUB_SHA}" \
+            --tag "${IMAGE}:sha-${short_sha}" \
+            .
+          echo "sha_tag=${IMAGE}:sha-${short_sha}" >> "${GITHUB_OUTPUT}"
+
+      - name: Tag and publish image
+        if: gitea.event_name == 'push'
+        shell: bash
+        env:
+          IMAGE: ${{ steps.registry.outputs.image }}
+          SHA_TAG: ${{ steps.build.outputs.sha_tag }}
+        run: |
+          docker push "${SHA_TAG}"
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            version="${GITHUB_REF_NAME#v}"
+            docker tag "${SHA_TAG}" "${IMAGE}:${version}"
+            docker push "${IMAGE}:${version}"
+          fi
+          if [ "${GITHUB_REF_NAME}" = "main" ]; then
+            docker tag "${SHA_TAG}" "${IMAGE}:latest"
+            docker push "${IMAGE}:latest"
+          fi

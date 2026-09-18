@@ -1,0 +1,34 @@
+name: huginn
+
+services:
+  server:
+    image: ${HUGINN_IMAGE:-huginn:local}
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    ports:
+      - "${HUGINN_PORT:-3000}:3000"
+    environment:
+      HUGINN_ADDR: 0.0.0.0:3000
+      HUGINN_DATABASE: /data/huginn.sqlite3
+      HUGINN_AZ_SIMULATIONS: ${HUGINN_AZ_SIMULATIONS:-48}
+      RUST_LOG: ${RUST_LOG:-info}
+      # To use a trained model, uncomment this and the bind mount below.
+      # HUGINN_AZ_MODEL: /models/best.json
+    volumes:
+      - huginn-data:/data
+      # - ./models/training/best.json:/models/best.json:ro
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "--show-error", "http://127.0.0.1:3000/api/health"]
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
+
+volumes:
+  huginn-data:

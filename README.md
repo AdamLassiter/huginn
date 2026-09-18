@@ -73,6 +73,25 @@ increases from left to right and T increases from top to bottom, so negative
 times appear above T0 and positive times below it. The view initially scrolls
 T0L0 to the middle-left of the viewport.
 
+## Containers
+
+Build and start the web server with persistent SQLite storage:
+
+```sh
+docker compose up --build -d
+```
+
+The service is available at <http://127.0.0.1:3000>. Change the host port or
+search strength with `HUGINN_PORT` and `HUGINN_AZ_SIMULATIONS`. To use a trained
+Muninn checkpoint, uncomment the model environment entry and bind mount in
+[`docker-compose.yaml`](docker-compose.yaml).
+
+The GitHub workflow tests every change, builds the image on pull requests, and
+publishes `ghcr.io/<owner>/<repository>` from `main` and `v*` tags. The matching
+Gitea workflow publishes to `<gitea-host>/<owner>/<repository>` using the
+built-in `GITEA_TOKEN`. Its runner must expose a Docker daemon, and repository
+Actions must allow the token `packages: write` permission.
+
 ## Architecture
 
 This is a Cargo workspace:
