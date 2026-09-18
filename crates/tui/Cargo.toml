@@ -1,0 +1,20 @@
+[package]
+name = "huginn-tui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Terminal interface for Huginn"
+
+[[bin]]
+name = "huginn"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+crossterm = "0.28"
+huginn-core = { path = "../core" }
+ratatui = "0.29"
+
+[lints]
+workspace = true
+

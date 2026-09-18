@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#111820">
+    <title>Huginn — Multiverse Hnefatafl</title>
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+    <link rel="stylesheet" href="/styles.css">
+  </head>
+  <body>
+    <header class="masthead">
+      <div>
+        <p class="eyebrow">Copenhagen hnefatafl across time</p>
+        <h1>Huginn</h1>
+      </div>
+      <div id="identity" class="identity"></div>
+    </header>
+
+    <main>
+      <section id="auth-view" class="auth-shell">
+        <article class="panel intro">
+          <p class="rune">ᚺ</p>
+          <h2>Watch every history unfold.</h2>
+          <p>Play conventional Copenhagen hnefatafl or branch pieces backward through time. Every board remains visible.</p>
+        </article>
+        <form id="auth-form" class="panel auth-form">
+          <div class="tabs">
+            <button type="button" data-auth-mode="login" class="active">Sign in</button>
+            <button type="button" data-auth-mode="register">Create account</button>
+          </div>
+          <label>Username <input name="username" autocomplete="username" required minlength="3" maxlength="24"></label>
+          <label id="display-name-field" hidden>Display name <input name="displayName" maxlength="40"></label>
+          <label>Password <input name="password" type="password" autocomplete="current-password" required minlength="8"></label>
+          <button class="primary" type="submit">Continue</button>
+          <p id="auth-error" class="error" role="alert"></p>
+        </form>
+      </section>
+
+      <section id="lobby-view" hidden>
+        <div class="dashboard-grid">
+          <article class="panel">
+            <h2>New match</h2>
+            <form id="new-game-form" class="stack">
+              <label>Opponent <select name="opponent"></select></label>
+              <label>Rules <select name="ruleset"><option value="multiverse">5D Copenhagen</option><option value="classic">Classic Copenhagen</option></select></label>
+              <label>Your side <select name="playAs"><option value="attacker">Attackers</option><option value="defender">Defenders</option></select></label>
+              <button class="primary" type="submit">Create game</button>
+            </form>
+          </article>
+          <article class="panel grow">
+            <h2>Your games</h2>
+            <div id="game-list" class="game-list"></div>
+          </article>
+          <article class="panel">
+            <h2>Elo standings</h2>
+            <ol id="leaderboard" class="leaderboard"></ol>
+          </article>
+        </div>
+      </section>
+
+      <section id="game-view" hidden>
+        <div class="game-toolbar panel">
+          <button id="back-to-lobby" type="button">← Lobby</button>
+          <div><strong id="game-title"></strong><span id="game-status"></span></div>
+          <div class="toolbar-actions"><button id="submit-turn" type="button">Submit turn</button><button id="refresh-game" type="button">Refresh</button></div>
+        </div>
+        <p id="game-notice" class="notice" role="status"></p>
+        <div id="multiverse-scroll" class="multiverse-scroll">
+          <div id="multiverse" class="multiverse"></div>
+        </div>
+        <article class="panel history-panel"><h2>History</h2><ol id="move-history"></ol></article>
+      </section>
+    </main>
+    <script type="module" src="/app.js"></script>
+  </body>
+</html>

@@ -1,0 +1,13 @@
+[package]
+name = "huginn-random-bot"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Simple deterministic baseline bot for Huginn"
+
+[dependencies]
+huginn-core = { path = "../core" }
+
+[lints]
+workspace = true
+
