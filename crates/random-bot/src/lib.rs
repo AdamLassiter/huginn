@@ -1,4 +1,4 @@
-use huginn_core::{AiPlayer, AiProfile, GameView, PlayerAction};
+use huginn_core::{AiPlayer, AiProfile, Game, PlayerAction};
 
 /// A tiny deterministic baseline used to prove the pluggable-AI boundary.
 pub struct RavenBot {
@@ -36,18 +36,12 @@ impl AiPlayer for RavenBot {
         }
     }
 
-    fn choose_action(&mut self, game: &GameView) -> Result<PlayerAction, String> {
-        if game.can_submit {
-            return Ok(PlayerAction::SubmitTurn);
-        }
-        let Some(movement) = game
-            .legal_moves
-            .get(self.next_index(game.legal_moves.len().max(1)))
-            .copied()
-        else {
+    fn choose_action(&mut self, game: &Game) -> Result<PlayerAction, String> {
+        let actions = game.legal_actions();
+        let Some(action) = actions.get(self.next_index(actions.len().max(1))).copied() else {
             return Err("no legal action is available".to_owned());
         };
-        Ok(PlayerAction::Move { movement })
+        Ok(action)
     }
 }
 
@@ -61,10 +55,7 @@ mod tests {
     fn bot_returns_an_authoritatively_legal_opening() {
         let game = Game::new(Ruleset::Classic);
         let mut bot = RavenBot::default();
-        let PlayerAction::Move { movement } = bot
-            .choose_action(&GameView::from_game(&game))
-            .expect("bot action")
-        else {
+        let PlayerAction::Move { movement } = bot.choose_action(&game).expect("bot action") else {
             panic!("classic opening cannot be a submission");
         };
         game.validate_move(movement).expect("legal bot move");

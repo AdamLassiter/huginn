@@ -2,3 +2,4 @@
 /huginn.sqlite3
 /huginn.sqlite3-shm
 /huginn.sqlite3-wal
+/models/training/

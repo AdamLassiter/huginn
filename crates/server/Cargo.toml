@@ -8,6 +8,7 @@ description = "Authoritative multiplayer web server for Huginn"
 [dependencies]
 argon2 = "0.5"
 axum = "0.8"
+huginn-alphazero = { path = "../alphazero" }
 huginn-core = { path = "../core" }
 huginn-random-bot = { path = "../random-bot" }
 rand_core = { version = "0.6", features = ["getrandom"] }

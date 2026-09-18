@@ -8,9 +8,10 @@ use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
+use huginn_alphazero::{MuninnBot, SearchConfig};
 use huginn_core::{
-    BOARD_EDGE, BOARD_SIZE_U8, BoardCoordinate, Game, GameOutcome, Move, Piece, Position, Ruleset,
-    Square,
+    AiPlayer, BOARD_EDGE, BOARD_SIZE_U8, BoardCoordinate, Game, GameOutcome, Move, Piece,
+    PlayerAction, Position, Ruleset, Side, Square,
 };
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
@@ -23,6 +24,13 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
 enum Mode {
     Classic,
     Multiverse,
+}
+
+#[derive(Clone, Copy, Debug, Default, ValueEnum, PartialEq, Eq)]
+enum Opponent {
+    #[default]
+    Human,
+    Muninn,
 }
 
 impl From<Mode> for Ruleset {
@@ -40,6 +48,12 @@ struct Cli {
     /// Start directly in the selected rules mode.
     #[arg(long, value_enum)]
     mode: Option<Mode>,
+    /// Choose a second human or the self-play-trained Muninn engine.
+    #[arg(long, value_enum, default_value_t)]
+    opponent: Opponent,
+    /// MCTS simulations per Muninn action.
+    #[arg(long, default_value_t = 48)]
+    ai_simulations: usize,
 }
 
 struct TerminalGuard {
@@ -73,6 +87,11 @@ enum Phase {
 struct App {
     phase: Phase,
     menu_choice: Ruleset,
+    menu_row: usize,
+    opponent: Opponent,
+    ai_simulations: usize,
+    bot: Option<MuninnBot>,
+    ai_failed: bool,
     game: Game,
     focus: BoardCoordinate,
     cursor: Square,
@@ -84,15 +103,20 @@ struct App {
 }
 
 impl App {
-    fn new(mode: Option<Mode>) -> Self {
+    fn new(mode: Option<Mode>, opponent: Opponent, ai_simulations: usize) -> Self {
         let ruleset = mode.map_or(Ruleset::Classic, Into::into);
-        Self {
+        let mut app = Self {
             phase: if mode.is_some() {
                 Phase::Playing
             } else {
                 Phase::Menu
             },
             menu_choice: ruleset,
+            menu_row: 0,
+            opponent,
+            ai_simulations,
+            bot: None,
+            ai_failed: false,
             game: Game::new(ruleset),
             focus: BoardCoordinate::new(0, 0),
             cursor: Square::new(5, 5).expect("center is on board"),
@@ -101,7 +125,11 @@ impl App {
             notice: String::new(),
             help: false,
             quit: false,
+        };
+        if mode.is_some() {
+            app.configure_bot();
         }
+        app
     }
 
     fn reset(&mut self, ruleset: Ruleset) {
@@ -112,7 +140,53 @@ impl App {
         self.legal_moves.clear();
         self.notice.clear();
         self.help = false;
+        self.ai_failed = false;
         self.phase = Phase::Playing;
+        self.configure_bot();
+    }
+
+    fn configure_bot(&mut self) {
+        self.bot = None;
+        if self.opponent != Opponent::Muninn {
+            return;
+        }
+        let search = SearchConfig {
+            simulations: self.ai_simulations,
+            ..SearchConfig::default()
+        };
+        let seed = 0x4d55_4e49_4e4e;
+        let configured_path = std::env::var_os("HUGINN_AZ_MODEL");
+        let default_path = std::path::Path::new("models/training/best.json");
+        let loaded = configured_path
+            .as_ref()
+            .map_or(default_path.exists(), |_| true)
+            .then(|| {
+                MuninnBot::load(
+                    configured_path
+                        .as_deref()
+                        .unwrap_or(default_path.as_os_str()),
+                    search,
+                    seed,
+                )
+            });
+        match loaded {
+            Some(Ok(bot)) => {
+                self.bot = Some(bot);
+                "Muninn loaded its trained checkpoint and plays Defenders."
+                    .clone_into(&mut self.notice);
+            }
+            Some(Err(error)) => {
+                self.bot = Some(MuninnBot::bootstrap(search, seed));
+                self.notice = format!(
+                    "Could not load Muninn checkpoint ({error}); using an untrained network."
+                );
+            }
+            None => {
+                self.bot = Some(MuninnBot::bootstrap(search, seed));
+                "No Muninn checkpoint found; using an untrained network."
+                    .clone_into(&mut self.notice);
+            }
+        }
     }
 
     fn handle_key(&mut self, key: KeyEvent) {
@@ -173,15 +247,65 @@ impl App {
 
     fn handle_menu_key(&mut self, key: KeyEvent) {
         match key.code {
-            KeyCode::Up | KeyCode::Down | KeyCode::Char('j' | 'k') => {
-                self.menu_choice = match self.menu_choice {
-                    Ruleset::Classic => Ruleset::Multiverse,
-                    Ruleset::Multiverse => Ruleset::Classic,
-                };
+            KeyCode::Up | KeyCode::Char('k') => self.menu_row = self.menu_row.saturating_sub(1),
+            KeyCode::Down | KeyCode::Char('j') => self.menu_row = (self.menu_row + 1).min(1),
+            KeyCode::Left | KeyCode::Right | KeyCode::Char('h' | 'l') => {
+                if self.menu_row == 0 {
+                    self.menu_choice = match self.menu_choice {
+                        Ruleset::Classic => Ruleset::Multiverse,
+                        Ruleset::Multiverse => Ruleset::Classic,
+                    };
+                } else {
+                    self.opponent = match self.opponent {
+                        Opponent::Human => Opponent::Muninn,
+                        Opponent::Muninn => Opponent::Human,
+                    };
+                }
             }
             KeyCode::Enter => self.reset(self.menu_choice),
             KeyCode::Char('q') | KeyCode::Esc => self.quit = true,
             _ => {}
+        }
+    }
+
+    fn advance_ai(&mut self) {
+        if self.phase != Phase::Playing
+            || self.opponent != Opponent::Muninn
+            || self.game.turn() != Side::Defender
+            || self.game.outcome().is_some()
+            || self.ai_failed
+        {
+            return;
+        }
+        for _ in 0..512 {
+            if self.game.turn() != Side::Defender || self.game.outcome().is_some() {
+                break;
+            }
+            let action = match self
+                .bot
+                .as_mut()
+                .expect("Muninn mode configures a bot")
+                .choose_action(&self.game)
+            {
+                Ok(action) => action,
+                Err(error) => {
+                    self.notice = format!("Muninn search failed: {error}");
+                    self.ai_failed = true;
+                    break;
+                }
+            };
+            if let Err(error) = self.game.apply_action(action) {
+                self.notice = format!("Muninn returned an illegal action: {error}");
+                self.ai_failed = true;
+                break;
+            }
+            self.notice = match action {
+                PlayerAction::Move { movement } => {
+                    format!("Muninn moved {} to {}.", movement.from, movement.to)
+                }
+                PlayerAction::SubmitTurn => "Muninn submitted its 5D turn.".to_owned(),
+            };
+            self.clear_selection_and_sync();
         }
     }
 
@@ -307,15 +431,13 @@ impl App {
     fn draw_menu(&self, frame: &mut ratatui::Frame<'_>) {
         let area = centered_rect(58, 15, frame.area());
         frame.render_widget(Clear, area);
-        let classic = if self.menu_choice == Ruleset::Classic {
-            ">"
-        } else {
-            " "
+        let rule = match self.menu_choice {
+            Ruleset::Classic => "Classic Copenhagen",
+            Ruleset::Multiverse => "5D Copenhagen",
         };
-        let multiverse = if self.menu_choice == Ruleset::Multiverse {
-            ">"
-        } else {
-            " "
+        let opponent = match self.opponent {
+            Opponent::Human => "Human vs human",
+            Opponent::Muninn => "Human vs Muninn (you attack)",
         };
         let text = vec![
             Line::from(Span::styled(
@@ -326,10 +448,16 @@ impl App {
             )),
             Line::from("Copenhagen hnefatafl"),
             Line::from(""),
-            Line::from(format!("{classic} Classic Copenhagen")),
-            Line::from(format!("{multiverse} 5D Copenhagen")),
+            Line::from(format!(
+                "{} Rules:    < {rule} >",
+                if self.menu_row == 0 { ">" } else { " " }
+            )),
+            Line::from(format!(
+                "{} Opponent: < {opponent} >",
+                if self.menu_row == 1 { ">" } else { " " }
+            )),
             Line::from(""),
-            Line::from("↑/↓ choose   Enter start   q quit"),
+            Line::from("↑/↓ field   ←/→ choose   Enter start   q quit"),
         ];
         frame.render_widget(
             Paragraph::new(text)
@@ -600,6 +728,15 @@ fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
 fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) -> io::Result<()> {
     while !app.quit {
         terminal.draw(|frame| app.draw(frame))?;
+        if app.phase == Phase::Playing
+            && app.opponent == Opponent::Muninn
+            && app.game.turn() == Side::Defender
+            && app.game.outcome().is_none()
+            && !app.ai_failed
+        {
+            app.advance_ai();
+            continue;
+        }
         if event::poll(Duration::from_millis(200))?
             && let Event::Key(key) = event::read()?
             && key.kind == KeyEventKind::Press
@@ -613,6 +750,31 @@ fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) -> io::
 fn main() -> io::Result<()> {
     let cli = Cli::parse();
     let mut guard = TerminalGuard::enter()?;
-    let mut app = App::new(cli.mode);
+    let mut app = App::new(cli.mode, cli.opponent, cli.ai_simulations);
     run(&mut guard.terminal, &mut app)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn muninn_completes_a_classic_defender_reply() {
+        let mut app = App::new(Some(Mode::Classic), Opponent::Human, 2);
+        app.opponent = Opponent::Muninn;
+        app.bot = Some(MuninnBot::bootstrap(
+            SearchConfig {
+                simulations: 2,
+                ..SearchConfig::default()
+            },
+            41,
+        ));
+        app.game
+            .apply_action(app.game.legal_actions()[0])
+            .expect("attacker opening");
+        assert_eq!(app.game.turn(), Side::Defender);
+        app.advance_ai();
+        assert_eq!(app.game.turn(), Side::Attacker);
+        assert!(!app.ai_failed);
+    }
 }

@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{BoardCoordinate, Game, GameOutcome, Move, Ruleset, Side, Timeline};
 
-/// Read-only state supplied to human frontends and pluggable AI players.
+/// Read-only state supplied to human frontends.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GameView {
@@ -59,6 +59,35 @@ pub enum PlayerAction {
     SubmitTurn,
 }
 
+impl Game {
+    /// Returns every action currently accepted by the authoritative engine.
+    #[must_use]
+    pub fn legal_actions(&self) -> Vec<PlayerAction> {
+        let mut actions = self
+            .legal_moves()
+            .into_iter()
+            .map(|movement| PlayerAction::Move { movement })
+            .collect::<Vec<_>>();
+        if self.can_submit() {
+            actions.push(PlayerAction::SubmitTurn);
+        }
+        actions
+    }
+
+    /// Applies one player action through the normal rules validation path.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same [`crate::MoveError`] produced by the underlying move
+    /// or multiverse turn-submission operation.
+    pub fn apply_action(&mut self, action: PlayerAction) -> Result<(), crate::MoveError> {
+        match action {
+            PlayerAction::Move { movement } => self.apply_move(movement),
+            PlayerAction::SubmitTurn => self.submit_turn(),
+        }
+    }
+}
+
 /// Interface implemented by separately packaged AI players.
 ///
 /// The server remains authoritative: it validates the returned action through
@@ -66,12 +95,12 @@ pub enum PlayerAction {
 pub trait AiPlayer: Send {
     fn profile(&self) -> AiProfile;
 
-    /// Selects one move or turn submission from a read-only position.
+    /// Selects one move or turn submission from an immutable position.
     ///
     /// # Errors
     ///
     /// Returns a diagnostic if the implementation cannot select an action.
-    fn choose_action(&mut self, game: &GameView) -> Result<PlayerAction, String>;
+    fn choose_action(&mut self, game: &Game) -> Result<PlayerAction, String>;
 }
 
 #[cfg(test)]
@@ -86,5 +115,14 @@ mod tests {
         assert_eq!(decoded.turn, Side::Attacker);
         assert_eq!(decoded.timelines.len(), 1);
         assert!(!decoded.legal_moves.is_empty());
+    }
+
+    #[test]
+    fn legal_actions_can_be_applied_to_a_clone() {
+        let game = Game::new(Ruleset::Classic);
+        let action = game.legal_actions()[0];
+        let mut next = game.clone();
+        next.apply_action(action).expect("legal action");
+        assert_eq!(next.turn(), Side::Defender);
     }
 }

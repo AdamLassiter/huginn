@@ -1,20 +1,18 @@
 [package]
-name = "huginn-tui"
+name = "huginn-trainer"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Terminal interface for Huginn"
-
-[[bin]]
-name = "huginn"
-path = "src/main.rs"
+description = "Self-play training and arena evaluation for Huginn AlphaZero"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
-crossterm = "0.28"
 huginn-alphazero = { path = "../alphazero" }
 huginn-core = { path = "../core" }
-ratatui = "0.29"
+rand = "0.9"
+rand_chacha = "0.9"
+rayon = "1"
+serde_json = "1"
 
 [lints]
 workspace = true

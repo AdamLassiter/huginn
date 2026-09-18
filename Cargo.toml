@@ -1,8 +1,10 @@
 [workspace]
 members = [
+    "crates/alphazero",
     "crates/core",
     "crates/random-bot",
     "crates/server",
+    "crates/trainer",
     "crates/tui",
 ]
 resolver = "3"

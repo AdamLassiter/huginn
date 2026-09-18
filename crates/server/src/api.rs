@@ -356,19 +356,13 @@ fn advance_bots(state: &AppState, mut stored: StoredGame) -> Result<StoredGame, 
             let bot = bots
                 .get_mut(&actor.id)
                 .ok_or_else(|| ApiError::internal("bot account has no loaded implementation"))?;
-            bot.choose_action(&GameView::from_game(&stored.game))
+            bot.choose_action(&stored.game)
                 .map_err(ApiError::internal)?
         };
-        match action {
-            PlayerAction::Move { movement } => {
-                stored.game.apply_move(movement).map_err(|error| {
-                    ApiError::internal(format!("bot returned illegal move: {error}"))
-                })?;
-            }
-            PlayerAction::SubmitTurn => stored.game.submit_turn().map_err(|error| {
-                ApiError::internal(format!("bot returned illegal submission: {error}"))
-            })?,
-        }
+        stored
+            .game
+            .apply_action(action)
+            .map_err(|error| ApiError::internal(format!("bot returned illegal action: {error}")))?;
         stored.version = state
             .database
             .save_action(

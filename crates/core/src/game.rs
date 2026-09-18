@@ -679,8 +679,14 @@ mod tests {
             Side::Defender,
             vec![timeline(0, None, boards)],
         );
+        let repetition = Move::new(pos(3, 0, 1, 2), pos(3, 0, 1, 1));
         assert_eq!(
-            game.apply_move(Move::new(pos(3, 0, 1, 2), pos(3, 0, 1, 1))),
+            game.validate_move(repetition),
+            Err(MoveError::DefenderRepetition)
+        );
+        assert!(!game.legal_moves().contains(&repetition));
+        assert_eq!(
+            game.apply_move(repetition),
             Err(MoveError::DefenderRepetition)
         );
         assert_eq!(game.latest_coordinate(0), Some(BoardCoordinate::new(3, 0)));
@@ -926,7 +932,7 @@ impl Game {
                 let candidate = Move::new(from, Position::new(from.board, square));
                 match self.validate_move(candidate) {
                     Ok(()) => moves.push(candidate),
-                    Err(MoveError::RestrictedDestination) => {}
+                    Err(MoveError::RestrictedDestination | MoveError::DefenderRepetition) => {}
                     Err(_) => break,
                 }
             }
@@ -974,7 +980,7 @@ impl Game {
     ///
     /// Returns a [`MoveError`] describing the first failed legality rule.
     pub fn validate_move(&self, movement: Move) -> Result<(), MoveError> {
-        self.state.validate_move(movement).map(|_| ())
+        self.state.validate_move_fully(movement).map(|_| ())
     }
 
     /// Applies one legal move transactionally.
@@ -1064,6 +1070,18 @@ impl Game {
 }
 
 impl State {
+    fn validate_move_fully(&self, movement: Move) -> Result<ValidatedMove, MoveError> {
+        let validated = self.validate_move(movement)?;
+        if validated.piece.side() == Side::Defender {
+            let mut next = self.clone();
+            let created = next.apply_validated_move(movement, validated);
+            if next.repeats_ancestor(&created) {
+                return Err(MoveError::DefenderRepetition);
+            }
+        }
+        Ok(validated)
+    }
+
     fn board(&self, coordinate: BoardCoordinate) -> Option<&BoardSnapshot> {
         self.timelines
             .get(&coordinate.timeline)?
@@ -1810,7 +1828,7 @@ impl State {
         for (dx, dy) in ORTHOGONAL {
             if let Some(square) = from.square.offset(dx, dy) {
                 let movement = Move::new(from, Position::new(from.board, square));
-                if self.validate_move(movement).is_ok() {
+                if self.validate_move_fully(movement).is_ok() {
                     return true;
                 }
             }
@@ -1822,7 +1840,7 @@ impl State {
                 time < from.board.time
                     && (from.board.time - time).rem_euclid(2) == 0
                     && self
-                        .validate_move(Move::new(
+                        .validate_move_fully(Move::new(
                             from,
                             Position::new(
                                 BoardCoordinate::new(time, from.board.timeline),
