@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/huginn-logo.svg" alt="Huginn — five-dimensional hnefatafl" width="760">
+</p>
+
 # Huginn
 
 Huginn is a Rust rules engine with terminal and multiplayer web interfaces for
