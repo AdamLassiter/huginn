@@ -54,6 +54,9 @@ mod tests {
         assert!(APP.contains("coordinate.time - minTime + 2"));
         assert!(APP.contains("Object.values(timeline.boards)"));
         assert!(STYLES.contains("repeat(var(--timeline-count)"));
+        assert!(STYLES.contains(
+            "repeat(var(--time-count), minmax(calc(var(--board-size) + 2.4rem), max-content))"
+        ));
         assert!(FAVICON.starts_with("<svg"));
     }
 }

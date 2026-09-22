@@ -61,7 +61,7 @@ label { display: flex; flex-direction: column; gap: .35rem; color: var(--muted);
 .toolbar-actions { display: flex; gap: .5rem; }
 .notice { min-height: 1.5em; color: var(--cyan); margin: .8rem 0; }
 .multiverse-scroll { overflow: auto; max-height: calc(100vh - 220px); min-height: 440px; border: 1px solid var(--line); border-radius: 8px; background-color: #080d11; background-image: linear-gradient(rgb(117 199 201 / 3%) 1px, transparent 1px), linear-gradient(90deg, rgb(117 199 201 / 3%) 1px, transparent 1px); background-size: 24px 24px; }
-.multiverse { display: grid; grid-template-columns: 44px repeat(var(--timeline-count), var(--board-size)); grid-template-rows: 32px repeat(var(--time-count), max-content); gap: 46px 34px; width: max-content; min-width: 100%; padding: 44vh 3rem; position: relative; align-items: start; }
+.multiverse { display: grid; grid-template-columns: 44px repeat(var(--timeline-count), var(--board-size)); grid-template-rows: 32px repeat(var(--time-count), minmax(calc(var(--board-size) + 2.4rem), max-content)); gap: 46px 34px; width: max-content; min-width: 100%; padding: 44vh 3rem; position: relative; align-items: start; }
 .axis-label { color: var(--muted); font-size: .75rem; position: sticky; z-index: 4; }
 .axis-label.timeline { top: 0; text-align: center; color: var(--gold); }
 .axis-label.time { left: 0; align-self: center; color: var(--cyan); }
