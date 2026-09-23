@@ -187,7 +187,7 @@ function renderBoard({ timeline, snapshot }, minRow, minTime, mine) {
   card.dataset.board = `${coordinate.time}:${coordinate.timeline}`;
   const caption = document.createElement("div");
   caption.className = "board-caption";
-  caption.innerHTML = `<strong>T${coordinate.time}L${timeline.row}</strong><span>${coordinate.time === latestTime ? "latest" : "history"}${active ? "" : " · inactive"}</span>`;
+  caption.innerHTML = `<strong>T${coordinate.time}L${timeline.row}</strong><span>${coordinate.time === latestTime ? "present" : coordinate.time < latestTime ? "past" : "future"}${active ? "" : " · inactive"}</span>`;
   const board = document.createElement("div");
   board.className = "board";
   for (let y = 10; y >= 0; y -= 1) {

@@ -22,12 +22,15 @@ directly:
 cargo run -p huginn-tui -- --mode classic
 cargo run -p huginn-tui -- --mode multiverse
 cargo run -p huginn-tui -- --mode classic --opponent muninn
+cargo run -p huginn-tui -- --mode classic --opponent huginn
 ```
 
-The new-game menu selects both the ruleset and a human or Muninn opponent. In
-AI games the human plays Attackers and Muninn plays Defenders. It uses the same
-`models/training/best.json` checkpoint and `HUGINN_AZ_MODEL` override as the web
-server; `--ai-simulations` controls TUI search strength and latency.
+The new-game menu selects the ruleset and a human, Muninn, or Huginn opponent.
+Muninn uses the CPU-trained `models/training/best-v2.json` checkpoint (overridden
+by `HUGINN_AZ_MODEL`); Huginn uses the GPU-trained
+`models/training-gpu/best-v2.json` checkpoint (overridden by
+`HUGINN_GPU_MODEL`). In AI games the human plays Attackers and the bot plays
+Defenders. `--ai-simulations` controls TUI search strength and latency.
 
 Controls:
 
@@ -62,8 +65,8 @@ HUGINN_ADDR=0.0.0.0:8080 HUGINN_DATABASE=/var/lib/huginn/huginn.sqlite3 \
 ```
 
 The web interface supports account creation, sign-in, classic and multiverse
-games, human opponents, the Raven baseline and Muninn AlphaZero bots, game
-history, and Elo standings.
+games, human opponents, the Raven baseline, Muninn CPU-model AlphaZero bot, and
+Huginn GPU-model AlphaZero bot, game history, and Elo standings.
 The browser polls for opponent moves while a game is open. The server is
 authoritative: every submitted move is validated by `huginn-core` before its
 new state and history entry are committed to SQLite.
@@ -82,9 +85,9 @@ docker compose up --build -d
 ```
 
 The service is available at <http://127.0.0.1:3000>. Change the host port or
-search strength with `HUGINN_PORT` and `HUGINN_AZ_SIMULATIONS`. To use a trained
-Muninn checkpoint, uncomment the model environment entry and bind mount in
-[`docker-compose.yaml`](docker-compose.yaml).
+search strength with `HUGINN_PORT` and `HUGINN_AZ_SIMULATIONS`. To use trained
+Muninn and Huginn checkpoints, uncomment the model environment entries and bind
+mounts in [`docker-compose.yaml`](docker-compose.yaml).
 
 The GitHub workflow tests every change, builds the image on pull requests, and
 publishes `ghcr.io/<owner>/<repository>` from `main` and `v*` tags. The matching
@@ -92,14 +95,24 @@ Gitea workflow publishes to `<gitea-host>/<owner>/<repository>` using the
 built-in `GITEA_TOKEN`. Its runner must expose a Docker daemon, and repository
 Actions must allow the token `packages: write` permission.
 
+Both workflows also publish checked, release-mode trainer archives for
+`x86_64-unknown-linux-gnu` and `x86_64-pc-windows-msvc`, including SHA-256
+checksums and the rules documentation. GitHub attaches the same archives to
+`v*` releases. A self-hosted Gitea installation must register a native Windows
+runner with the `windows-latest` label (and Visual Studio C++ build tools) in
+addition to its `ubuntu-latest` runner; the Windows binary cannot be produced
+by a Linux-only runner.
+
 ## Architecture
 
 This is a Cargo workspace:
 
 - `crates/core`: serializable game state, rules, legal moves, and the `AiPlayer`
   integration contract.
-- `crates/alphazero`: fixed-size 5D state encoding, residual policy/value
-  network, PUCT search, replay storage, self-play, and arena evaluation.
+- `crates/neural`: Burn-based, backend-neutral multiverse encoder and residual
+  policy/value network.
+- `crates/alphazero`: PUCT search, compact trajectory replay, self-play, and
+  arena evaluation.
 - `crates/random-bot`: a separately packaged baseline AI implementation.
 - `crates/server`: Axum server, authoritative game orchestration, embedded web
   client, Argon2 passwords, SQLite history, and Elo updates.
@@ -122,11 +135,15 @@ arena gate decides whether a candidate replaces the incumbent. Huginn keeps the
 trainer in Rust and uses a variable-action head so temporal moves do not require
 a finite, pre-enumerated move vocabulary.
 
-Muninn learns from MCTS visit distributions and final self-play outcomes only.
-The network has a shared residual state trunk, a value head, and a policy head
-that scores the legal actions in each position. The state encoder hash-pools all
-boards in a game, allowing one checkpoint to handle both classic positions and
-multiverse histories without imposing a maximum timeline or time coordinate.
+Muninn and Huginn learn from MCTS visit distributions and final self-play
+outcomes only. The network encodes every immutable board as attacker, defender,
+king, throne, and corner planes plus timeline metadata. A shared convolutional
+residual trunk embeds each board; masked mean/max pooling supplies multiverse
+context, and the policy head scores each legal action from that context and its
+source and destination board embeddings. Dynamically padded batches handle
+both classic positions and multiverse histories without a fixed maximum
+timeline or time coordinate. Version-2 replay files store compact authoritative
+trajectories in `replay-v2.bin.zst` and reconstruct positions for fitting.
 
 Start or resume the default mixed-rules training loop with:
 
@@ -141,20 +158,57 @@ Rust's `available_parallelism()`; pass `--threads N` to override it.
 
 Each iteration generates noisy self-play games, appends them to a bounded replay
 window, trains a candidate, and evaluates it against the incumbent with colours
-alternated. A candidate is promoted to `best.json` only when it reaches the
-configured arena score. The server loads that checkpoint automatically; use
-`HUGINN_AZ_MODEL` for another path and `HUGINN_AZ_SIMULATIONS` to trade response
-time for search strength. Until a checkpoint exists, the server explicitly logs
-that Muninn is using an untrained bootstrap network.
+alternated. A candidate is promoted to `best-v2.json` only when it reaches the
+configured arena score. This JSON checkpoint embeds a backend-neutral,
+full-precision Burn record. The server loads the conventional checkpoint paths
+automatically; use `HUGINN_AZ_MODEL` to override Muninn's path,
+`HUGINN_GPU_MODEL` to override Huginn's path, and `HUGINN_AZ_SIMULATIONS` to
+trade response time for search strength. Until a checkpoint exists, the server
+explicitly logs that the corresponding bot is using an untrained bootstrap
+network. CPU-trained checkpoints conventionally live under `models/training`;
+Vulkan-trained checkpoints live under `models/training-gpu`, allowing both bots
+to coexist.
 
 Arena games report progress every 25 actions by default. If training is
-interrupted after `candidate.json` is written, resume only its promotion match
+interrupted after `candidate-v2.json` is written, resume only its promotion match
 without repeating self-play:
 
 ```sh
 cargo run --release -p huginn-trainer -- \
   --work-dir models/training --ruleset both --arena-only
 ```
+
+### AMD GPU fitting on Windows
+
+The trainer can fit the network through Burn's Vulkan backend on native
+Windows. This does not require ROCm: install a current AMD Adrenalin driver
+(which supplies the RX 7900 XTX Vulkan driver), then download and extract the
+`huginn-trainer-windows-x86_64` CI artifact or release archive. It can be run
+directly from PowerShell without installing Rust:
+
+```powershell
+.\huginn-trainer.exe --work-dir models/training-gpu --ruleset both `
+  --training-device vulkan --model-size large
+```
+
+To build it locally instead, install Rust 1.92 or newer and run:
+
+```powershell
+cargo run --release -p huginn-trainer -- `
+  --work-dir models/training-gpu --ruleset both `
+  --training-device vulkan --model-size large
+```
+
+Self-play, MCTS, arena evaluation, the TUI, and the server still use CPU
+inference; `--training-device` selects only the fitting phase. Vulkan startup or
+device errors are reported and are never silently changed to CPU training. To
+fit an existing replay without generating games or running an arena, add
+`--fit-only`. The default `--batch-token-budget 262144` bounds padded board and
+action work; lower it if the driver reports an out-of-memory error.
+
+Version-1 `best.json` and `replay.json` files are left untouched because their
+hashed inputs and flat network are not compatible with this model. The trainer
+warns about them and creates version-2 files alongside them.
 
 For a quick pipeline smoke test rather than useful training:
 

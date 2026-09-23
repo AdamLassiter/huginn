@@ -7,22 +7,29 @@
 #![allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
 
 mod bot;
-mod encoding;
-mod network;
 mod search;
 mod self_play;
 
-pub use bot::MuninnBot;
-pub use encoding::{
-    ACTION_FEATURES, EncodedPosition, STATE_FEATURES, encode, encode_action, encode_state,
-};
-pub use network::{
-    ModelError, NetworkConfig, PolicyValueNetwork, Prediction, TrainConfig, TrainMetrics,
-    TrainingExample,
+mod encoding {
+    pub use huginn_neural::encode;
+}
+
+mod network {
+    pub use huginn_neural::{
+        ModelError, NetworkConfig, PolicyValueEvaluator, PolicyValueNetwork, TrainingExample,
+    };
+}
+
+pub use bot::{HuginnBot, MuninnBot};
+pub use huginn_neural::{
+    ACTION_FEATURES, BOARD_METADATA_FEATURES, BOARD_PLANES, EncodedAction, EncodedBoard,
+    EncodedPosition, GLOBAL_FEATURES, ModelError, ModelSize, NetworkConfig, PolicyValueEvaluator,
+    PolicyValueNetwork, Prediction, TrainConfig, TrainMetrics, TrainingExample, encode,
+    encode_action,
 };
 pub use search::{Mcts, SearchConfig, SearchResult};
 pub use self_play::{
     ArenaGameConfig, ArenaGameResult, ArenaProgress, ArenaReport, ReplayBuffer, ReplayError,
-    SelfPlayConfig, SelfPlayGame, play_arena_game, play_self_play_game, run_arena,
+    ReplayStep, SelfPlayConfig, SelfPlayGame, play_arena_game, play_self_play_game, run_arena,
     run_arena_schedule, run_arena_schedule_with_progress,
 };

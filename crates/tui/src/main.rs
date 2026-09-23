@@ -8,7 +8,7 @@ use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
-use huginn_alphazero::{MuninnBot, SearchConfig};
+use huginn_alphazero::{HuginnBot, MuninnBot, SearchConfig};
 use huginn_core::{
     AiPlayer, BOARD_EDGE, BOARD_SIZE_U8, BoardCoordinate, Game, GameOutcome, Move, Piece,
     PlayerAction, Position, Ruleset, Side, Square,
@@ -31,6 +31,7 @@ enum Opponent {
     #[default]
     Human,
     Muninn,
+    Huginn,
 }
 
 impl From<Mode> for Ruleset {
@@ -48,10 +49,10 @@ struct Cli {
     /// Start directly in the selected rules mode.
     #[arg(long, value_enum)]
     mode: Option<Mode>,
-    /// Choose a second human or the self-play-trained Muninn engine.
+    /// Choose a second human, CPU-model Muninn, or GPU-model Huginn.
     #[arg(long, value_enum, default_value_t)]
     opponent: Opponent,
-    /// MCTS simulations per Muninn action.
+    /// MCTS simulations per AI action.
     #[arg(long, default_value_t = 48)]
     ai_simulations: usize,
 }
@@ -90,7 +91,7 @@ struct App {
     menu_row: usize,
     opponent: Opponent,
     ai_simulations: usize,
-    bot: Option<MuninnBot>,
+    bot: Option<Box<dyn AiPlayer>>,
     ai_failed: bool,
     game: Game,
     focus: BoardCoordinate,
@@ -147,45 +148,73 @@ impl App {
 
     fn configure_bot(&mut self) {
         self.bot = None;
-        if self.opponent != Opponent::Muninn {
+        if self.opponent == Opponent::Human {
             return;
         }
         let search = SearchConfig {
             simulations: self.ai_simulations,
             ..SearchConfig::default()
         };
-        let seed = 0x4d55_4e49_4e4e;
-        let configured_path = std::env::var_os("HUGINN_AZ_MODEL");
-        let default_path = std::path::Path::new("models/training/best.json");
+        let (name, seed, configured_path, default_path) = match self.opponent {
+            Opponent::Human => unreachable!("human games do not configure a bot"),
+            Opponent::Muninn => (
+                "Muninn",
+                0x4d55_4e49_4e4e,
+                std::env::var_os("HUGINN_AZ_MODEL"),
+                std::path::Path::new("models/training/best-v2.json"),
+            ),
+            Opponent::Huginn => (
+                "Huginn",
+                0x4855_4749_4e4e,
+                std::env::var_os("HUGINN_GPU_MODEL"),
+                std::path::Path::new("models/training-gpu/best-v2.json"),
+            ),
+        };
         let loaded = configured_path
             .as_ref()
             .map_or(default_path.exists(), |_| true)
-            .then(|| {
-                MuninnBot::load(
+            .then(|| match self.opponent {
+                Opponent::Muninn => MuninnBot::load(
                     configured_path
                         .as_deref()
                         .unwrap_or(default_path.as_os_str()),
                     search,
                     seed,
                 )
+                .map(|bot| Box::new(bot) as Box<dyn AiPlayer>),
+                Opponent::Huginn => HuginnBot::load(
+                    configured_path
+                        .as_deref()
+                        .unwrap_or(default_path.as_os_str()),
+                    search,
+                    seed,
+                )
+                .map(|bot| Box::new(bot) as Box<dyn AiPlayer>),
+                Opponent::Human => unreachable!("human games do not configure a bot"),
             });
         match loaded {
             Some(Ok(bot)) => {
                 self.bot = Some(bot);
-                "Muninn loaded its trained checkpoint and plays Defenders."
-                    .clone_into(&mut self.notice);
+                self.notice = format!("{name} loaded its trained checkpoint and plays Defenders.");
             }
             Some(Err(error)) => {
-                self.bot = Some(MuninnBot::bootstrap(search, seed));
+                self.bot = Some(self.bootstrap_bot(search, seed));
                 self.notice = format!(
-                    "Could not load Muninn checkpoint ({error}); using an untrained network."
+                    "Could not load {name} checkpoint ({error}); using an untrained network."
                 );
             }
             None => {
-                self.bot = Some(MuninnBot::bootstrap(search, seed));
-                "No Muninn checkpoint found; using an untrained network."
-                    .clone_into(&mut self.notice);
+                self.bot = Some(self.bootstrap_bot(search, seed));
+                self.notice = format!("No {name} checkpoint found; using an untrained network.");
             }
+        }
+    }
+
+    fn bootstrap_bot(&self, search: SearchConfig, seed: u64) -> Box<dyn AiPlayer> {
+        match self.opponent {
+            Opponent::Muninn => Box::new(MuninnBot::bootstrap(search, seed)),
+            Opponent::Huginn => Box::new(HuginnBot::bootstrap(search, seed)),
+            Opponent::Human => unreachable!("human games do not configure a bot"),
         }
     }
 
@@ -258,7 +287,8 @@ impl App {
                 } else {
                     self.opponent = match self.opponent {
                         Opponent::Human => Opponent::Muninn,
-                        Opponent::Muninn => Opponent::Human,
+                        Opponent::Muninn => Opponent::Huginn,
+                        Opponent::Huginn => Opponent::Human,
                     };
                 }
             }
@@ -270,7 +300,7 @@ impl App {
 
     fn advance_ai(&mut self) {
         if self.phase != Phase::Playing
-            || self.opponent != Opponent::Muninn
+            || self.opponent == Opponent::Human
             || self.game.turn() != Side::Defender
             || self.game.outcome().is_some()
             || self.ai_failed
@@ -281,29 +311,26 @@ impl App {
             if self.game.turn() != Side::Defender || self.game.outcome().is_some() {
                 break;
             }
-            let action = match self
-                .bot
-                .as_mut()
-                .expect("Muninn mode configures a bot")
-                .choose_action(&self.game)
-            {
+            let bot = self.bot.as_mut().expect("AI mode configures a bot");
+            let name = bot.profile().display_name;
+            let action = match bot.choose_action(&self.game) {
                 Ok(action) => action,
                 Err(error) => {
-                    self.notice = format!("Muninn search failed: {error}");
+                    self.notice = format!("{name} search failed: {error}");
                     self.ai_failed = true;
                     break;
                 }
             };
             if let Err(error) = self.game.apply_action(action) {
-                self.notice = format!("Muninn returned an illegal action: {error}");
+                self.notice = format!("{name} returned an illegal action: {error}");
                 self.ai_failed = true;
                 break;
             }
             self.notice = match action {
                 PlayerAction::Move { movement } => {
-                    format!("Muninn moved {} to {}.", movement.from, movement.to)
+                    format!("{name} moved {} to {}.", movement.from, movement.to)
                 }
-                PlayerAction::SubmitTurn => "Muninn submitted its 5D turn.".to_owned(),
+                PlayerAction::SubmitTurn => format!("{name} submitted its 5D turn."),
             };
             self.clear_selection_and_sync();
         }
@@ -437,7 +464,8 @@ impl App {
         };
         let opponent = match self.opponent {
             Opponent::Human => "Human vs human",
-            Opponent::Muninn => "Human vs Muninn (you attack)",
+            Opponent::Muninn => "Human vs Muninn CPU (you attack)",
+            Opponent::Huginn => "Human vs Huginn GPU model (you attack)",
         };
         let text = vec![
             Line::from(Span::styled(
@@ -729,7 +757,7 @@ fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) -> io::
     while !app.quit {
         terminal.draw(|frame| app.draw(frame))?;
         if app.phase == Phase::Playing
-            && app.opponent == Opponent::Muninn
+            && app.opponent != Opponent::Human
             && app.game.turn() == Side::Defender
             && app.game.outcome().is_none()
             && !app.ai_failed
@@ -759,22 +787,34 @@ mod tests {
     use super::*;
 
     #[test]
-    fn muninn_completes_a_classic_defender_reply() {
-        let mut app = App::new(Some(Mode::Classic), Opponent::Human, 2);
-        app.opponent = Opponent::Muninn;
-        app.bot = Some(MuninnBot::bootstrap(
-            SearchConfig {
+    fn both_neural_opponents_complete_a_classic_defender_reply() {
+        for opponent in [Opponent::Muninn, Opponent::Huginn] {
+            let mut app = App::new(Some(Mode::Classic), Opponent::Human, 2);
+            app.opponent = opponent;
+            let search = SearchConfig {
                 simulations: 2,
                 ..SearchConfig::default()
-            },
-            41,
-        ));
-        app.game
-            .apply_action(app.game.legal_actions()[0])
-            .expect("attacker opening");
-        assert_eq!(app.game.turn(), Side::Defender);
-        app.advance_ai();
-        assert_eq!(app.game.turn(), Side::Attacker);
-        assert!(!app.ai_failed);
+            };
+            app.bot = Some(match opponent {
+                Opponent::Muninn => Box::new(MuninnBot::bootstrap_with_config(
+                    search,
+                    41,
+                    huginn_alphazero::NetworkConfig::tiny(),
+                )),
+                Opponent::Huginn => Box::new(HuginnBot::bootstrap_with_config(
+                    search,
+                    43,
+                    huginn_alphazero::NetworkConfig::tiny(),
+                )),
+                Opponent::Human => unreachable!(),
+            });
+            app.game
+                .apply_action(app.game.legal_actions()[0])
+                .expect("attacker opening");
+            assert_eq!(app.game.turn(), Side::Defender);
+            app.advance_ai();
+            assert_eq!(app.game.turn(), Side::Attacker);
+            assert!(!app.ai_failed);
+        }
     }
 }

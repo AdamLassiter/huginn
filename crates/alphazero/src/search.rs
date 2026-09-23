@@ -3,7 +3,7 @@ use rand::Rng;
 use rand_distr::{Distribution, Gamma};
 
 use crate::encoding::encode;
-use crate::network::PolicyValueNetwork;
+use crate::network::{PolicyValueEvaluator, PolicyValueNetwork};
 
 #[derive(Clone, Copy, Debug)]
 pub struct SearchConfig {
@@ -61,8 +61,8 @@ impl SearchResult {
     }
 }
 
-pub struct Mcts<'a> {
-    network: &'a PolicyValueNetwork,
+pub struct Mcts<'a, E: PolicyValueEvaluator + ?Sized = PolicyValueNetwork> {
+    network: &'a E,
     config: SearchConfig,
 }
 
@@ -80,9 +80,9 @@ struct Edge {
     child: Option<Box<Node>>,
 }
 
-impl<'a> Mcts<'a> {
+impl<'a, E: PolicyValueEvaluator + ?Sized> Mcts<'a, E> {
     #[must_use]
-    pub const fn new(network: &'a PolicyValueNetwork, config: SearchConfig) -> Self {
+    pub const fn new(network: &'a E, config: SearchConfig) -> Self {
         Self { network, config }
     }
 
@@ -263,7 +263,7 @@ mod tests {
     #[test]
     fn search_returns_legal_action_and_accounts_for_every_simulation() {
         let mut rng = ChaCha8Rng::seed_from_u64(17);
-        let network = PolicyValueNetwork::random(NetworkConfig { hidden: 8 }, &mut rng);
+        let network = PolicyValueNetwork::random(NetworkConfig::tiny(), &mut rng);
         let game = Game::new(Ruleset::Classic);
         let search = Mcts::new(
             &network,
@@ -282,7 +282,7 @@ mod tests {
     #[test]
     fn multiverse_search_handles_an_action_without_a_side_change() {
         let mut rng = ChaCha8Rng::seed_from_u64(19);
-        let network = PolicyValueNetwork::random(NetworkConfig { hidden: 8 }, &mut rng);
+        let network = PolicyValueNetwork::random(NetworkConfig::tiny(), &mut rng);
         let game = Game::new(Ruleset::Multiverse);
         let result = Mcts::new(
             &network,

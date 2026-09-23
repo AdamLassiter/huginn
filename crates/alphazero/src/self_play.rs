@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::Path;
 
-use huginn_core::{Game, GameOutcome, Ruleset, Side};
+use huginn_core::{Game, GameOutcome, PlayerAction, Ruleset, Side};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -34,14 +34,39 @@ impl Default for SelfPlayConfig {
 
 #[derive(Clone, Debug)]
 pub struct SelfPlayGame {
-    pub examples: Vec<TrainingExample>,
+    pub ruleset: Ruleset,
+    pub steps: Vec<ReplayStep>,
     pub outcome: Option<GameOutcome>,
     pub truncated: bool,
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ReplayStep {
+    pub action: PlayerAction,
+    pub policy: Vec<f32>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct ReplayGame {
+    ruleset: Ruleset,
+    steps: Vec<ReplayStep>,
+    outcome: Option<GameOutcome>,
+    truncated: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ReplayBuffer {
-    examples: Vec<TrainingExample>,
+    format_version: u32,
+    games: Vec<ReplayGame>,
+}
+
+impl Default for ReplayBuffer {
+    fn default() -> Self {
+        Self {
+            format_version: 2,
+            games: Vec::new(),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -92,8 +117,12 @@ impl ArenaReport {
 pub enum ReplayError {
     #[error("replay I/O failed: {0}")]
     Io(#[from] std::io::Error),
-    #[error("replay JSON is invalid: {0}")]
-    Json(#[from] serde_json::Error),
+    #[error("replay data is invalid: {0}")]
+    Codec(String),
+    #[error("unsupported replay format version {0}")]
+    Version(u32),
+    #[error("replay trajectory is invalid: {0}")]
+    Trajectory(String),
 }
 
 #[must_use]
@@ -104,7 +133,7 @@ pub fn play_self_play_game(
     rng: &mut impl Rng,
 ) -> SelfPlayGame {
     let mut game = Game::new(ruleset);
-    let mut pending = Vec::new();
+    let mut steps = Vec::new();
     for action_index in 0..config.max_actions {
         if game.outcome().is_some() {
             break;
@@ -121,22 +150,18 @@ pub fn play_self_play_game(
         let Some(action) = search.sample_action(temperature, rng) else {
             break;
         };
-        pending.push((encode(&game, &search.actions), search.policy, game.turn()));
+        steps.push(ReplayStep {
+            action,
+            policy: search.policy,
+        });
         if game.apply_action(action).is_err() {
             break;
         }
     }
     let outcome = game.outcome();
-    let examples = pending
-        .into_iter()
-        .map(|(position, policy, side)| TrainingExample {
-            position,
-            policy,
-            value: outcome.map_or(0.0, |result| if result.winner == side { 1.0 } else { -1.0 }),
-        })
-        .collect();
     SelfPlayGame {
-        examples,
+        ruleset,
+        steps,
         outcome,
         truncated: outcome.is_none(),
     }
@@ -288,28 +313,67 @@ pub fn play_arena_game(
 impl ReplayBuffer {
     #[must_use]
     pub fn len(&self) -> usize {
-        self.examples.len()
+        self.games.iter().map(|game| game.steps.len()).sum()
     }
 
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.examples.is_empty()
+        self.games.is_empty()
     }
 
-    #[must_use]
-    pub fn examples(&self) -> &[TrainingExample] {
-        &self.examples
+    /// Reconstructs encoded training positions from compact authoritative trajectories.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a stored policy/action no longer matches authoritative rules.
+    pub fn examples(&self) -> Result<Vec<TrainingExample>, ReplayError> {
+        let mut examples = Vec::with_capacity(self.len());
+        for replay in &self.games {
+            let mut game = Game::new(replay.ruleset);
+            for (index, step) in replay.steps.iter().enumerate() {
+                let actions = game.legal_actions();
+                if actions.len() != step.policy.len() {
+                    return Err(ReplayError::Trajectory(format!(
+                        "step {index} has {} policy entries for {} legal actions",
+                        step.policy.len(),
+                        actions.len()
+                    )));
+                }
+                if !actions.contains(&step.action) {
+                    return Err(ReplayError::Trajectory(format!(
+                        "step {index} selects an action that is no longer legal"
+                    )));
+                }
+                let side = game.turn();
+                examples.push(TrainingExample {
+                    position: encode(&game, &actions),
+                    policy: step.policy.clone(),
+                    value: replay.outcome.map_or(0.0, |outcome| {
+                        if outcome.winner == side { 1.0 } else { -1.0 }
+                    }),
+                });
+                game.apply_action(step.action).map_err(|error| {
+                    ReplayError::Trajectory(format!("step {index} cannot be applied: {error}"))
+                })?;
+            }
+        }
+        Ok(examples)
     }
 
-    pub fn extend(&mut self, examples: impl IntoIterator<Item = TrainingExample>, capacity: usize) {
-        self.examples.extend(examples);
-        let overflow = self.examples.len().saturating_sub(capacity);
-        if overflow > 0 {
-            self.examples.drain(..overflow);
+    pub fn extend_game(&mut self, game: SelfPlayGame, capacity: usize) {
+        self.format_version = 2;
+        self.games.push(ReplayGame {
+            ruleset: game.ruleset,
+            steps: game.steps,
+            outcome: game.outcome,
+            truncated: game.truncated,
+        });
+        while self.games.len() > 1 && self.len() > capacity {
+            self.games.remove(0);
         }
     }
 
-    /// Saves the replay window atomically as JSON.
+    /// Saves the replay window atomically as `MessagePack` data compressed with zstd.
     ///
     /// # Errors
     ///
@@ -319,19 +383,29 @@ impl ReplayBuffer {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        let temporary = path.with_extension("json.tmp");
-        fs::write(&temporary, serde_json::to_vec(self)?)?;
+        let temporary = path.with_extension("zst.tmp");
+        let bytes =
+            rmp_serde::to_vec_named(self).map_err(|error| ReplayError::Codec(error.to_string()))?;
+        let compressed = zstd::stream::encode_all(bytes.as_slice(), 3)?;
+        fs::write(&temporary, compressed)?;
         fs::rename(temporary, path)?;
         Ok(())
     }
 
-    /// Loads a replay window from JSON.
+    /// Loads a version-2 compressed replay window.
     ///
     /// # Errors
     ///
     /// Returns an error if the source cannot be read or decoded.
     pub fn load(path: impl AsRef<Path>) -> Result<Self, ReplayError> {
-        Ok(serde_json::from_slice(&fs::read(path)?)?)
+        let compressed = fs::read(path)?;
+        let bytes = zstd::stream::decode_all(compressed.as_slice())?;
+        let replay: Self =
+            rmp_serde::from_slice(&bytes).map_err(|error| ReplayError::Codec(error.to_string()))?;
+        if replay.format_version != 2 {
+            return Err(ReplayError::Version(replay.format_version));
+        }
+        Ok(replay)
     }
 }
 
@@ -347,7 +421,7 @@ mod tests {
     #[test]
     fn short_self_play_game_produces_aligned_examples_and_draw_targets() {
         let mut rng = ChaCha8Rng::seed_from_u64(23);
-        let model = PolicyValueNetwork::random(NetworkConfig { hidden: 8 }, &mut rng);
+        let model = PolicyValueNetwork::random(NetworkConfig::tiny(), &mut rng);
         let game = play_self_play_game(
             &model,
             Ruleset::Classic,
@@ -362,9 +436,11 @@ mod tests {
             },
             &mut rng,
         );
-        assert_eq!(game.examples.len(), 2);
+        assert_eq!(game.steps.len(), 2);
         assert!(game.truncated);
-        for example in game.examples {
+        let mut replay = ReplayBuffer::default();
+        replay.extend_game(game, 10);
+        for example in replay.examples().unwrap() {
             assert_eq!(example.position.actions.len(), example.policy.len());
             assert!((example.policy.iter().sum::<f32>() - 1.0).abs() < 1.0e-5);
             assert!(example.value.abs() < f32::EPSILON);
@@ -372,24 +448,38 @@ mod tests {
     }
 
     #[test]
-    fn replay_capacity_discards_oldest_examples() {
-        let game = Game::new(Ruleset::Classic);
-        let actions = game.legal_actions();
-        let example = TrainingExample {
-            position: encode(&game, &actions),
-            policy: vec![1.0 / actions.len() as f32; actions.len()],
-            value: 0.0,
+    fn replay_capacity_discards_oldest_complete_games_and_round_trips() {
+        let make_game = || {
+            let game = Game::new(Ruleset::Classic);
+            let actions = game.legal_actions();
+            SelfPlayGame {
+                ruleset: Ruleset::Classic,
+                steps: vec![ReplayStep {
+                    action: actions[0],
+                    policy: vec![1.0 / actions.len() as f32; actions.len()],
+                }],
+                outcome: None,
+                truncated: true,
+            }
         };
         let mut replay = ReplayBuffer::default();
-        replay.extend([example.clone(), example.clone(), example], 2);
+        replay.extend_game(make_game(), 2);
+        replay.extend_game(make_game(), 2);
+        replay.extend_game(make_game(), 2);
         assert_eq!(replay.len(), 2);
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("replay-v2.bin.zst");
+        replay.save(&path).unwrap();
+        let loaded = ReplayBuffer::load(path).unwrap();
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded.examples().unwrap().len(), 2);
     }
 
     #[test]
     fn arena_progress_reports_actions_and_alternating_candidate_sides() {
         let mut rng = ChaCha8Rng::seed_from_u64(37);
-        let candidate = PolicyValueNetwork::random(NetworkConfig { hidden: 4 }, &mut rng);
-        let incumbent = PolicyValueNetwork::random(NetworkConfig { hidden: 4 }, &mut rng);
+        let candidate = PolicyValueNetwork::random(NetworkConfig::tiny(), &mut rng);
+        let incumbent = PolicyValueNetwork::random(NetworkConfig::tiny(), &mut rng);
         let mut events = Vec::new();
         let report = run_arena_schedule_with_progress(
             &candidate,

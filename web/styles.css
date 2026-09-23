@@ -72,7 +72,7 @@ label { display: flex; flex-direction: column; gap: .35rem; color: var(--muted);
 .board-caption { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: .4rem; font-size: .72rem; color: var(--muted); }
 .board-caption strong { color: var(--ink); }
 .board { display: grid; grid-template-columns: repeat(11, 1fr); aspect-ratio: 1; border: 2px solid #0b1013; }
-.square { border: 0; border-radius: 0; padding: 0; display: grid; place-items: center; min-width: 0; font-family: Georgia, serif; font-size: calc(var(--board-size) / 16); line-height: 1; color: #101417; background: var(--board-light); }
+.square { border: 0; border-radius: 0; padding: 0; display: grid; place-items: center; min-width: 16px; min-height: 16px; font-family: Georgia, serif; font-size: calc(var(--board-size) / 16); line-height: 1; color: #101417; background: var(--board-light); }
 .square.dark { background: var(--board-dark); }
 .square.restricted { background: #53666a; }
 .square .piece { width: 72%; aspect-ratio: 1; border-radius: 50%; display: grid; place-items: center; box-shadow: inset 0 -3px 5px rgb(0 0 0 / 30%), 0 2px 4px rgb(0 0 0 / 45%); font-weight: 900; }

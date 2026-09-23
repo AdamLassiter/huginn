@@ -1,11 +1,12 @@
 use std::error::Error;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::time::Instant;
 
 use clap::{Parser, ValueEnum};
 use huginn_alphazero::{
-    ArenaGameConfig, ArenaReport, NetworkConfig, PolicyValueNetwork, ReplayBuffer, SearchConfig,
-    SelfPlayConfig, SelfPlayGame, TrainConfig, play_arena_game, play_self_play_game,
+    ArenaGameConfig, ArenaReport, ModelSize, NetworkConfig, PolicyValueNetwork, ReplayBuffer,
+    SearchConfig, SelfPlayConfig, SelfPlayGame, TrainConfig, play_arena_game, play_self_play_game,
 };
 use huginn_core::{Ruleset, Side};
 use rand::SeedableRng;
@@ -21,6 +22,27 @@ enum RuleSelection {
     Classic,
     Multiverse,
     Both,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum TrainingDevice {
+    Cpu,
+    Vulkan,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum ModelSizeArgument {
+    Compact,
+    Large,
+}
+
+impl From<ModelSizeArgument> for ModelSize {
+    fn from(value: ModelSizeArgument) -> Self {
+        match value {
+            ModelSizeArgument::Compact => Self::Compact,
+            ModelSizeArgument::Large => Self::Large,
+        }
+    }
 }
 
 #[derive(Debug, Parser)]
@@ -44,6 +66,9 @@ struct Arguments {
     /// Evaluate the saved candidate against best without generating or training.
     #[arg(long)]
     arena_only: bool,
+    /// Fit the saved replay only, without self-play or arena evaluation.
+    #[arg(long)]
+    fit_only: bool,
     #[arg(long, default_value_t = 400)]
     max_actions: usize,
     #[arg(long, default_value_t = 100_000)]
@@ -52,12 +77,17 @@ struct Arguments {
     epochs: usize,
     #[arg(long, default_value_t = 64)]
     batch_size: usize,
+    /// Approximate padded board/action elements allowed in one fitting batch.
+    #[arg(long, default_value_t = 262_144)]
+    batch_token_budget: usize,
     #[arg(long, default_value_t = 0.001)]
     learning_rate: f32,
     #[arg(long, default_value_t = 0.55)]
     promotion_score: f32,
-    #[arg(long, default_value_t = 48)]
-    hidden: usize,
+    #[arg(long, value_enum, default_value_t = ModelSizeArgument::Large)]
+    model_size: ModelSizeArgument,
+    #[arg(long, value_enum, default_value_t = TrainingDevice::Cpu)]
+    training_device: TrainingDevice,
     #[arg(long, default_value_t = 0x4855_4749_4e4e)]
     seed: u64,
     #[arg(long, value_enum, default_value_t = RuleSelection::Both)]
@@ -91,14 +121,16 @@ fn main() -> Result<(), Box<dyn Error>> {
 }
 
 fn train(arguments: &Arguments, pool: &ThreadPool) -> Result<(), Box<dyn Error>> {
-    if arguments.hidden == 0 {
-        return Err("--hidden must be greater than zero".into());
+    if arguments.arena_only && arguments.fit_only {
+        return Err("--arena-only and --fit-only cannot be used together".into());
     }
     let mut rng = ChaCha8Rng::seed_from_u64(arguments.seed);
-    let best_path = arguments.work_dir.join("best.json");
-    let candidate_path = arguments.work_dir.join("candidate.json");
-    let replay_path = arguments.work_dir.join("replay.json");
-    let mut best = load_or_initialize(&best_path, arguments.hidden, &mut rng)?;
+    let best_path = arguments.work_dir.join("best-v2.json");
+    let candidate_path = arguments.work_dir.join("candidate-v2.json");
+    let replay_path = arguments.work_dir.join("replay-v2.bin.zst");
+    warn_about_v1_files(&arguments.work_dir, &best_path, &replay_path);
+    let network_config = NetworkConfig::from(ModelSize::from(arguments.model_size));
+    let mut best = load_or_initialize(&best_path, network_config, &mut rng)?;
     let search = SearchConfig {
         simulations: arguments.simulations,
         ..SearchConfig::default()
@@ -124,45 +156,47 @@ fn train(arguments: &Arguments, pool: &ThreadPool) -> Result<(), Box<dyn Error>>
         ReplayBuffer::default()
     };
 
+    if arguments.fit_only {
+        if replay.is_empty() {
+            return Err(format!("{} contains no training positions", replay_path.display()).into());
+        }
+        let mut candidate = best.clone();
+        fit_candidate(arguments, &replay, &mut candidate, &mut rng)?;
+        candidate.save(&candidate_path)?;
+        println!(
+            "fit-only complete; candidate saved to {} (arena and promotion skipped)",
+            candidate_path.display()
+        );
+        return Ok(());
+    }
+
     for iteration in 0..arguments.iterations {
+        let self_play_started = Instant::now();
         let mut decisive = 0;
         let mut truncated = 0;
         let generated = generate_self_play(arguments, &best, search, iteration, replay.len(), pool);
         for generated in generated {
             decisive += usize::from(generated.game.outcome.is_some());
             truncated += usize::from(generated.game.truncated);
-            replay.extend(generated.game.examples, arguments.replay_capacity);
+            replay.extend_game(generated.game, arguments.replay_capacity);
         }
         println!(
             "iteration {} self-play batch complete: replay={}, decisive={}, truncated={}",
             iteration + 1,
             replay.len(),
             decisive,
-            truncated
+            truncated,
         );
+        println!("self-play time: {:.2?}", self_play_started.elapsed());
         replay.save(&replay_path)?;
 
         let mut candidate = best.clone();
-        let metrics = candidate.train(
-            replay.examples(),
-            TrainConfig {
-                epochs: arguments.epochs,
-                batch_size: arguments.batch_size,
-                learning_rate: arguments.learning_rate,
-                ..TrainConfig::default()
-            },
-            &mut rng,
-        );
+        fit_candidate(arguments, &replay, &mut candidate, &mut rng)?;
         candidate.save(&candidate_path)?;
-        println!(
-            "trained {} examples: policy_loss={:.5}, value_loss={:.5}, steps={}",
-            metrics.examples,
-            metrics.policy_loss,
-            metrics.value_loss,
-            candidate.training_steps()
-        );
 
+        let arena_started = Instant::now();
         evaluate_and_maybe_promote(&candidate, &mut best, &best_path, arguments, search, pool)?;
+        println!("arena time: {:.2?}", arena_started.elapsed());
     }
     Ok(())
 }
@@ -203,23 +237,80 @@ fn evaluate_and_maybe_promote(
 
 fn load_or_initialize(
     path: &Path,
-    hidden: usize,
+    config: NetworkConfig,
     rng: &mut ChaCha8Rng,
 ) -> Result<PolicyValueNetwork, Box<dyn Error>> {
     if path.exists() {
         let model = PolicyValueNetwork::load(path)?;
-        if model.config().hidden != hidden {
+        if model.config() != config {
             return Err(format!(
-                "checkpoint hidden size is {}, but --hidden is {hidden}",
-                model.config().hidden
+                "checkpoint architecture is {:?}, but --model-size requests {:?}",
+                model.config(),
+                config
             )
             .into());
         }
         Ok(model)
     } else {
-        let model = PolicyValueNetwork::random(NetworkConfig { hidden }, rng);
+        let model = PolicyValueNetwork::random(config, rng);
         model.save(path)?;
         Ok(model)
+    }
+}
+
+fn fit_candidate(
+    arguments: &Arguments,
+    replay: &ReplayBuffer,
+    candidate: &mut PolicyValueNetwork,
+    rng: &mut ChaCha8Rng,
+) -> Result<(), Box<dyn Error>> {
+    let reconstruction_started = Instant::now();
+    let examples = replay.examples()?;
+    println!(
+        "reconstructed {} training positions in {:.2?}",
+        examples.len(),
+        reconstruction_started.elapsed()
+    );
+    let fit_started = Instant::now();
+    let train_config = TrainConfig {
+        epochs: arguments.epochs,
+        batch_size: arguments.batch_size,
+        batch_token_budget: arguments.batch_token_budget,
+        learning_rate: arguments.learning_rate,
+        ..TrainConfig::default()
+    };
+    let metrics = match arguments.training_device {
+        TrainingDevice::Cpu => candidate.train(&examples, train_config, rng),
+        TrainingDevice::Vulkan => candidate.train_vulkan(&examples, train_config, rng)?,
+    };
+    println!(
+        "trained {} examples on {:?}: policy_loss={:.5}, value_loss={:.5}, steps={}, fit_time={:.2?}",
+        metrics.examples,
+        arguments.training_device,
+        metrics.policy_loss,
+        metrics.value_loss,
+        candidate.training_steps(),
+        fit_started.elapsed()
+    );
+    Ok(())
+}
+
+fn warn_about_v1_files(work_dir: &Path, best_v2: &Path, replay_v2: &Path) {
+    let old_best = work_dir.join("best.json");
+    if !best_v2.exists() && old_best.exists() {
+        eprintln!(
+            "warning: {} is a version-1 checkpoint and cannot initialize the new multiverse network; creating {}",
+            old_best.display(),
+            best_v2.display()
+        );
+    }
+    let old_replay = work_dir.join("replay.json");
+    if !replay_v2.exists() && old_replay.exists() {
+        eprintln!(
+            "warning: {} is a version-1 replay and is intentionally left untouched; starting {}",
+            old_replay.display(),
+            replay_v2.display()
+        );
     }
 }
 
@@ -359,7 +450,7 @@ fn generate_self_play(
                         iteration + 1,
                         game_index + 1,
                         arguments.games,
-                        game.examples.len(),
+                        game.steps.len(),
                         usize::from(game.outcome.is_some()),
                         usize::from(game.truncated),
                         arguments.games
@@ -428,6 +519,16 @@ mod tests {
         assert!(matches!(arguments.ruleset, RuleSelection::Both));
         assert_eq!(arguments.threads, default_threads());
         assert_eq!(arguments.iterations, 1);
+        assert!(matches!(arguments.training_device, TrainingDevice::Cpu));
+        assert!(matches!(arguments.model_size, ModelSizeArgument::Large));
+        assert_eq!(arguments.batch_token_budget, 262_144);
+    }
+
+    #[test]
+    fn obsolete_hidden_option_is_rejected() {
+        let error = Arguments::try_parse_from(["trainer", "--hidden", "48"])
+            .expect_err("old flat-network option must not be accepted");
+        assert!(error.to_string().contains("unexpected argument '--hidden'"));
     }
 
     #[test]

@@ -9,10 +9,10 @@ description = "Self-play training and arena evaluation for Huginn AlphaZero"
 clap = { version = "4", features = ["derive"] }
 huginn-alphazero = { path = "../alphazero" }
 huginn-core = { path = "../core" }
+huginn-neural = { path = "../neural", features = ["training", "vulkan"] }
 rand = "0.9"
 rand_chacha = "0.9"
 rayon = "1"
-serde_json = "1"
 
 [lints]
 workspace = true
