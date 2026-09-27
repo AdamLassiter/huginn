@@ -15,3 +15,5 @@ pub use network::{
     ModelError, PolicyValueEvaluator, PolicyValueNetwork, Prediction, TrainConfig, TrainMetrics,
     TrainingExample,
 };
+#[cfg(all(feature = "training", feature = "vulkan"))]
+pub use network::{VulkanDeviceInfo, VulkanPolicyValueEvaluator, VulkanTrainingDevice};

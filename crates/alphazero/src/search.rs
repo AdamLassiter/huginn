@@ -8,6 +8,8 @@ use crate::network::{PolicyValueEvaluator, PolicyValueNetwork};
 #[derive(Clone, Copy, Debug)]
 pub struct SearchConfig {
     pub simulations: usize,
+    /// Maximum number of independently selected leaves evaluated together.
+    pub inference_batch_size: usize,
     pub exploration: f32,
     pub dirichlet_alpha: f32,
     pub dirichlet_fraction: f32,
@@ -17,6 +19,7 @@ impl Default for SearchConfig {
     fn default() -> Self {
         Self {
             simulations: 96,
+            inference_batch_size: 8,
             exploration: 1.5,
             dirichlet_alpha: 0.3,
             dirichlet_fraction: 0.25,
@@ -77,7 +80,21 @@ struct Edge {
     prior: f32,
     visits: u32,
     value_sum: f32,
+    virtual_visits: u32,
     child: Option<Box<Node>>,
+}
+
+struct PendingSimulation {
+    path: Vec<usize>,
+    evaluation: PendingEvaluation,
+}
+
+enum PendingEvaluation {
+    Terminal(f32),
+    Network {
+        actions: Vec<PlayerAction>,
+        position: huginn_neural::EncodedPosition,
+    },
 }
 
 impl<'a, E: PolicyValueEvaluator + ?Sized> Mcts<'a, E> {
@@ -87,6 +104,12 @@ impl<'a, E: PolicyValueEvaluator + ?Sized> Mcts<'a, E> {
     }
 
     #[must_use]
+    /// Searches one position with batched policy/value leaf evaluation.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the evaluator violates its contract by returning a different
+    /// number of predictions than encoded positions.
     pub fn search(&self, game: &Game, add_noise: bool, rng: &mut impl Rng) -> SearchResult {
         if let Some(outcome) = game.outcome() {
             return SearchResult {
@@ -101,8 +124,38 @@ impl<'a, E: PolicyValueEvaluator + ?Sized> Mcts<'a, E> {
         if add_noise {
             add_dirichlet_noise(&mut root.edges, self.config, rng);
         }
-        for _ in 0..self.config.simulations {
-            self.simulate(&mut root, game);
+        let batch_size = self.config.inference_batch_size.max(1);
+        let mut completed = 0;
+        while completed < self.config.simulations {
+            let count = batch_size.min(self.config.simulations - completed);
+            let pending = (0..count)
+                .map(|_| self.select(&mut root, game))
+                .collect::<Vec<_>>();
+            let positions = pending
+                .iter()
+                .filter_map(|simulation| match &simulation.evaluation {
+                    PendingEvaluation::Network { position, .. } => Some(position.clone()),
+                    PendingEvaluation::Terminal(_) => None,
+                })
+                .collect::<Vec<_>>();
+            let mut predictions = self.network.predict_batch(&positions).into_iter();
+            for simulation in pending {
+                let (value, expansion) = match simulation.evaluation {
+                    PendingEvaluation::Terminal(value) => (value, None),
+                    PendingEvaluation::Network { actions, .. } => {
+                        let prediction = predictions
+                            .next()
+                            .expect("batched evaluator returns one prediction per position");
+                        (prediction.value, Some((actions, prediction.policy)))
+                    }
+                };
+                complete_simulation(&mut root, &simulation.path, value, expansion);
+            }
+            assert!(
+                predictions.next().is_none(),
+                "batched evaluator result count"
+            );
+            completed += count;
         }
         let actions = root
             .edges
@@ -131,17 +184,36 @@ impl<'a, E: PolicyValueEvaluator + ?Sized> Mcts<'a, E> {
         }
     }
 
-    fn simulate(&self, node: &mut Node, game: &Game) -> f32 {
+    fn select(&self, root: &mut Node, game: &Game) -> PendingSimulation {
+        let mut path = Vec::new();
+        let evaluation = self.select_from(root, game, &mut path);
+        PendingSimulation { path, evaluation }
+    }
+
+    fn select_from(
+        &self,
+        node: &mut Node,
+        game: &Game,
+        path: &mut Vec<usize>,
+    ) -> PendingEvaluation {
         if let Some(outcome) = game.outcome() {
-            return outcome_value(outcome.winner, node.side);
+            return PendingEvaluation::Terminal(outcome_value(outcome.winner, node.side));
         }
         if !node.expanded {
-            return self.expand(node, game);
+            let actions = game.legal_actions();
+            return PendingEvaluation::Network {
+                position: encode(game, &actions),
+                actions,
+            };
         }
         if node.edges.is_empty() {
-            return -1.0;
+            return PendingEvaluation::Terminal(-1.0);
         }
-        let total_visits = node.edges.iter().map(|edge| edge.visits).sum::<u32>();
+        let total_visits = node
+            .edges
+            .iter()
+            .map(|edge| edge.visits + edge.virtual_visits)
+            .sum::<u32>();
         let edge_index = node
             .edges
             .iter()
@@ -160,20 +232,14 @@ impl<'a, E: PolicyValueEvaluator + ?Sized> Mcts<'a, E> {
             edge.prior = 0.0;
             edge.visits += 1;
             edge.value_sum -= 1.0;
-            return -1.0;
+            return PendingEvaluation::Terminal(-1.0);
         }
+        edge.virtual_visits += 1;
+        path.push(edge_index);
         let child = edge
             .child
             .get_or_insert_with(|| Box::new(Node::new(next.turn())));
-        let child_value = self.simulate(child, &next);
-        let value = if child.side == node.side {
-            child_value
-        } else {
-            -child_value
-        };
-        edge.visits += 1;
-        edge.value_sum += value;
-        value
+        self.select_from(child, &next, path)
     }
 
     fn expand(&self, node: &mut Node, game: &Game) -> f32 {
@@ -188,6 +254,7 @@ impl<'a, E: PolicyValueEvaluator + ?Sized> Mcts<'a, E> {
                 prior,
                 visits: 0,
                 value_sum: 0.0,
+                virtual_visits: 0,
                 child: None,
             })
             .collect();
@@ -206,12 +273,59 @@ impl Node {
 }
 
 fn puct(edge: &Edge, total_visits: u32, exploration: f32) -> f32 {
-    let mean = if edge.visits == 0 {
+    let effective_visits = edge.visits + edge.virtual_visits;
+    let mean = if effective_visits == 0 {
         0.0
     } else {
-        edge.value_sum / edge.visits as f32
+        edge.value_sum / effective_visits as f32
     };
-    mean + exploration * edge.prior * ((total_visits + 1) as f32).sqrt() / (edge.visits + 1) as f32
+    mean + exploration * edge.prior * ((total_visits + 1) as f32).sqrt()
+        / (effective_visits + 1) as f32
+}
+
+fn complete_simulation(
+    node: &mut Node,
+    path: &[usize],
+    leaf_value: f32,
+    expansion: Option<(Vec<PlayerAction>, Vec<f32>)>,
+) -> f32 {
+    let Some((&edge_index, remainder)) = path.split_first() else {
+        if let Some((actions, policy)) = expansion {
+            node.expanded = true;
+            node.edges = actions
+                .into_iter()
+                .zip(policy)
+                .map(|(action, prior)| Edge {
+                    action,
+                    prior,
+                    visits: 0,
+                    value_sum: 0.0,
+                    virtual_visits: 0,
+                    child: None,
+                })
+                .collect();
+        }
+        return leaf_value;
+    };
+    let edge = &mut node.edges[edge_index];
+    let child = edge
+        .child
+        .as_deref_mut()
+        .expect("selected search path has a child");
+    let child_side = child.side;
+    let child_value = complete_simulation(child, remainder, leaf_value, expansion);
+    let value = if child_side == node.side {
+        child_value
+    } else {
+        -child_value
+    };
+    edge.virtual_visits = edge
+        .virtual_visits
+        .checked_sub(1)
+        .expect("completed path has a virtual visit");
+    edge.visits += 1;
+    edge.value_sum += value;
+    value
 }
 
 fn outcome_value(winner: Side, perspective: Side) -> f32 {
@@ -252,6 +366,8 @@ fn sample_weighted(weights: &[f32], rng: &mut impl Rng) -> usize {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use huginn_core::{Game, Ruleset};
     use rand::SeedableRng;
     use rand_chacha::ChaCha8Rng;
@@ -259,6 +375,36 @@ mod tests {
     use crate::network::NetworkConfig;
 
     use super::*;
+
+    #[derive(Default)]
+    struct CountingEvaluator {
+        calls: AtomicUsize,
+        largest_batch: AtomicUsize,
+    }
+
+    impl PolicyValueEvaluator for CountingEvaluator {
+        fn predict(&self, position: &huginn_neural::EncodedPosition) -> huginn_neural::Prediction {
+            self.predict_batch(std::slice::from_ref(position))
+                .pop()
+                .unwrap()
+        }
+
+        fn predict_batch(
+            &self,
+            positions: &[huginn_neural::EncodedPosition],
+        ) -> Vec<huginn_neural::Prediction> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            self.largest_batch
+                .fetch_max(positions.len(), Ordering::Relaxed);
+            positions
+                .iter()
+                .map(|position| huginn_neural::Prediction {
+                    policy: vec![1.0 / position.actions.len() as f32; position.actions.len()],
+                    value: 0.0,
+                })
+                .collect()
+        }
+    }
 
     #[test]
     fn search_returns_legal_action_and_accounts_for_every_simulation() {
@@ -293,5 +439,25 @@ mod tests {
         )
         .search(&game, false, &mut rng);
         assert!(result.best_action().is_some());
+    }
+
+    #[test]
+    fn search_batches_leaf_evaluations() {
+        let evaluator = CountingEvaluator::default();
+        let game = Game::new(Ruleset::Classic);
+        let mut rng = ChaCha8Rng::seed_from_u64(23);
+        let result = Mcts::new(
+            &evaluator,
+            SearchConfig {
+                simulations: 8,
+                inference_batch_size: 4,
+                ..SearchConfig::default()
+            },
+        )
+        .search(&game, false, &mut rng);
+
+        assert_eq!(result.visits.iter().sum::<u32>(), 8);
+        assert_eq!(evaluator.largest_batch.load(Ordering::Relaxed), 4);
+        assert!(evaluator.calls.load(Ordering::Relaxed) < 9);
     }
 }

@@ -1,5 +1,7 @@
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
@@ -9,6 +11,9 @@ use burn::module::{AutodiffModule, Module};
 use burn::record::{FullPrecisionSettings, NamedMpkBytesRecorder, Recorder};
 use burn::tensor::activation::{log_softmax, softmax};
 use burn::tensor::backend::Backend;
+use burn::tensor::{Tensor, TensorData};
+#[cfg(all(feature = "training", feature = "vulkan"))]
+use huginn_core::{Game, Ruleset};
 use rand::{Rng, SeedableRng};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -16,11 +21,15 @@ use thiserror::Error;
 #[cfg(feature = "training")]
 use burn::optim::{AdamConfig, GradientsParams, Optimizer, decay::WeightDecayConfig};
 #[cfg(feature = "training")]
-use burn::tensor::{Tensor, TensorData, backend::AutodiffBackend};
+use burn::tensor::backend::AutodiffBackend;
 
-use crate::{BatchTensors, EncodedPosition, MultiverseNet, NetworkConfig};
+use crate::{
+    BOARD_PLANES, BatchTensors, EncodedBoard, EncodedPosition, MultiverseNet, NetworkConfig,
+};
 
 const FORMAT_VERSION: u32 = 2;
+const SPATIAL_CACHE_LIMIT: usize = 16_384;
+const SPATIAL_KEY_WORDS: usize = (BOARD_PLANES * 121).div_ceil(64);
 type CpuBackend = NdArray<f32>;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -71,11 +80,53 @@ pub struct TrainMetrics {
     pub examples: usize,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct PolicyValueNetwork {
     model: MultiverseNet<CpuBackend>,
     config: NetworkConfig,
     training_steps: u64,
+    spatial_cache: Arc<Mutex<SpatialCache>>,
+}
+
+impl Clone for PolicyValueNetwork {
+    fn clone(&self) -> Self {
+        Self {
+            model: self.model.clone(),
+            config: self.config,
+            training_steps: self.training_steps,
+            spatial_cache: Arc::new(Mutex::new(SpatialCache::default())),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+struct SpatialKey([u64; SPATIAL_KEY_WORDS]);
+
+impl SpatialKey {
+    fn from_board(board: &EncodedBoard) -> Self {
+        let mut words = [0_u64; SPATIAL_KEY_WORDS];
+        for (index, value) in board.planes.iter().enumerate() {
+            if *value != 0.0 {
+                words[index / 64] |= 1_u64 << (index % 64);
+            }
+        }
+        Self(words)
+    }
+}
+
+#[derive(Debug, Default)]
+struct SpatialCache {
+    embeddings: HashMap<SpatialKey, Vec<f32>>,
+    hits: u64,
+    misses: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[doc(hidden)]
+pub struct SpatialCacheStats {
+    pub entries: usize,
+    pub hits: u64,
+    pub misses: u64,
 }
 
 #[derive(Debug, Error)]
@@ -92,6 +143,214 @@ pub enum ModelError {
     Version(u32),
     #[error("checkpoint architecture does not match its declared configuration")]
     Shape,
+    #[cfg(all(feature = "training", feature = "vulkan"))]
+    #[error("Vulkan training device initialization failed: {0}")]
+    VulkanInitialization(String),
+}
+
+#[cfg(all(feature = "training", feature = "vulkan"))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VulkanDeviceInfo {
+    pub discrete_gpu_index: usize,
+    pub name: String,
+    pub vendor: u32,
+    pub device: u32,
+    pub device_type: String,
+    pub backend: String,
+    pub driver: String,
+    pub driver_info: String,
+}
+
+#[cfg(all(feature = "training", feature = "vulkan"))]
+#[derive(Debug)]
+pub struct VulkanTrainingDevice {
+    device: burn::backend::wgpu::WgpuDevice,
+    info: VulkanDeviceInfo,
+}
+
+/// Policy/value evaluator whose forward passes execute on one verified Vulkan GPU.
+#[cfg(all(feature = "training", feature = "vulkan"))]
+#[derive(Debug)]
+pub struct VulkanPolicyValueEvaluator {
+    model: MultiverseNet<burn::backend::Vulkan>,
+    config: NetworkConfig,
+    device: burn::backend::wgpu::WgpuDevice,
+    spatial_cache: Mutex<SpatialCache>,
+}
+
+#[cfg(all(feature = "training", feature = "vulkan"))]
+impl VulkanTrainingDevice {
+    /// Initializes one discrete GPU through Vulkan and executes a synchronized
+    /// compute probe. This never selects a CPU or software fallback adapter.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the requested adapter is absent, is not a discrete
+    /// Vulkan GPU, or cannot execute and read back the probe operation.
+    pub fn initialize(discrete_gpu_index: usize) -> Result<Self, ModelError> {
+        use burn::backend::Vulkan;
+        use burn::backend::wgpu::{RuntimeOptions, WgpuDevice, graphics, init_setup};
+        use burn::tensor::Tensor;
+
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::VULKAN,
+            ..wgpu::InstanceDescriptor::new_without_display_handle()
+        });
+        let adapters =
+            cubecl_common::future::block_on(instance.enumerate_adapters(wgpu::Backends::VULKAN));
+        let available = adapters
+            .iter()
+            .map(wgpu::Adapter::get_info)
+            .collect::<Vec<_>>();
+        let expected = available
+            .iter()
+            .filter(|info| info.device_type == wgpu::DeviceType::DiscreteGpu)
+            .nth(discrete_gpu_index)
+            .ok_or_else(|| {
+                let description = if available.is_empty() {
+                    "no Vulkan adapters were reported".to_owned()
+                } else {
+                    available
+                        .iter()
+                        .map(|info| format!("'{}' ({:?})", info.name, info.device_type))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                };
+                ModelError::VulkanInitialization(format!(
+                    "discrete GPU index {discrete_gpu_index} is unavailable; detected: {description}"
+                ))
+            })?
+            .clone();
+
+        let initialized = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let device = WgpuDevice::DiscreteGpu(discrete_gpu_index);
+            let setup = init_setup::<graphics::Vulkan>(&device, RuntimeOptions::default());
+            let adapter = setup.adapter.get_info();
+            if adapter.backend != wgpu::Backend::Vulkan {
+                return Err(ModelError::VulkanInitialization(format!(
+                    "adapter '{}' uses {:?}, not Vulkan",
+                    adapter.name, adapter.backend
+                )));
+            }
+            if adapter.device_type != wgpu::DeviceType::DiscreteGpu {
+                return Err(ModelError::VulkanInitialization(format!(
+                    "adapter '{}' is {:?}, not a discrete GPU; software and CPU fallbacks are disabled",
+                    adapter.name, adapter.device_type
+                )));
+            }
+            if adapter.vendor != expected.vendor
+                || adapter.device != expected.device
+                || adapter.name != expected.name
+            {
+                return Err(ModelError::VulkanInitialization(format!(
+                    "Burn selected '{}', but Vulkan discovery selected '{}'; refusing an ambiguous device selection",
+                    adapter.name, expected.name
+                )));
+            }
+
+            let result = Tensor::<Vulkan, 1>::from_floats([1.25, -0.5], &device)
+                .mul_scalar(2.0)
+                .into_data()
+                .to_vec::<f32>()
+                .map_err(|error| ModelError::VulkanInitialization(error.to_string()))?;
+            if result != [2.5, -1.0] {
+                return Err(ModelError::VulkanInitialization(format!(
+                    "compute probe returned unexpected values {result:?}"
+                )));
+            }
+
+            Ok(Self {
+                device,
+                info: VulkanDeviceInfo {
+                    discrete_gpu_index,
+                    name: adapter.name,
+                    vendor: adapter.vendor,
+                    device: adapter.device,
+                    device_type: format!("{:?}", adapter.device_type),
+                    backend: format!("{:?}", adapter.backend),
+                    driver: adapter.driver,
+                    driver_info: adapter.driver_info,
+                },
+            })
+        }));
+
+        match initialized {
+            Ok(result) => result,
+            Err(payload) => Err(ModelError::VulkanInitialization(panic_message(
+                payload.as_ref(),
+            ))),
+        }
+    }
+
+    #[must_use]
+    pub const fn info(&self) -> &VulkanDeviceInfo {
+        &self.info
+    }
+
+    /// Copies a CPU-resident checkpoint to this device for batched inference.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the backend-neutral model record cannot be transferred.
+    pub fn evaluator(
+        &self,
+        network: &PolicyValueNetwork,
+    ) -> Result<VulkanPolicyValueEvaluator, ModelError> {
+        let bytes = record_bytes(network.model.clone())?;
+        let evaluator = VulkanPolicyValueEvaluator {
+            model: model_from_bytes(network.config, bytes, &self.device)?,
+            config: network.config,
+            device: self.device.clone(),
+            spatial_cache: Mutex::new(SpatialCache::default()),
+        };
+        let probe = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let game = Game::new(Ruleset::Classic);
+            let actions = game.legal_actions();
+            evaluator.predict(&crate::encode(&game, &actions))
+        }))
+        .map_err(|payload| ModelError::VulkanInitialization(panic_message(payload.as_ref())))?;
+        if probe.policy.is_empty()
+            || !probe.value.is_finite()
+            || probe.policy.iter().any(|value| !value.is_finite())
+        {
+            return Err(ModelError::VulkanInitialization(
+                "full policy/value inference probe returned invalid values".to_owned(),
+            ));
+        }
+        Ok(evaluator)
+    }
+}
+
+#[cfg(all(feature = "training", feature = "vulkan"))]
+impl PolicyValueEvaluator for VulkanPolicyValueEvaluator {
+    fn predict(&self, position: &EncodedPosition) -> Prediction {
+        self.predict_batch(std::slice::from_ref(position))
+            .pop()
+            .expect("single-position Vulkan batch returns one prediction")
+    }
+
+    fn predict_batch(&self, positions: &[EncodedPosition]) -> Vec<Prediction> {
+        predict_batch_cached(
+            &self.model,
+            self.config,
+            &self.spatial_cache,
+            positions,
+            &self.device,
+        )
+    }
+}
+
+#[cfg(all(feature = "training", feature = "vulkan"))]
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    payload.downcast_ref::<String>().map_or_else(
+        || {
+            payload.downcast_ref::<&str>().map_or_else(
+                || "unknown Vulkan runtime failure".to_owned(),
+                |value| (*value).to_owned(),
+            )
+        },
+        Clone::clone,
+    )
 }
 
 #[derive(Serialize, Deserialize)]
@@ -113,6 +372,7 @@ impl PolicyValueNetwork {
             model: MultiverseNet::new(config, &device),
             config,
             training_steps: 0,
+            spatial_cache: Arc::new(Mutex::new(SpatialCache::default())),
         }
     }
 
@@ -124,6 +384,17 @@ impl PolicyValueNetwork {
     #[must_use]
     pub const fn training_steps(&self) -> u64 {
         self.training_steps
+    }
+
+    #[doc(hidden)]
+    #[must_use]
+    pub fn spatial_cache_stats(&self) -> SpatialCacheStats {
+        let cache = self.spatial_cache.lock().expect("spatial cache lock");
+        SpatialCacheStats {
+            entries: cache.embeddings.len(),
+            hits: cache.hits,
+            misses: cache.misses,
+        }
     }
 
     #[must_use]
@@ -147,31 +418,14 @@ impl PolicyValueNetwork {
     }
 
     fn predict_batch_cpu(&self, positions: &[EncodedPosition]) -> Vec<Prediction> {
-        if positions.is_empty() {
-            return Vec::new();
-        }
         let device = NdArrayDevice::default();
-        let batch = BatchTensors::from_positions(positions, self.config.board_embedding, &device);
-        let output = self.model.forward(batch);
-        let action_count = output.logits.dims()[1];
-        let policies = softmax(output.logits, 1)
-            .to_data()
-            .to_vec::<f32>()
-            .expect("CPU policy tensor uses f32");
-        let values = output
-            .value
-            .to_data()
-            .to_vec::<f32>()
-            .expect("CPU value tensor uses f32");
-        positions
-            .iter()
-            .enumerate()
-            .map(|(row, position)| Prediction {
-                policy: policies[row * action_count..row * action_count + position.actions.len()]
-                    .to_vec(),
-                value: values[row],
-            })
-            .collect()
+        predict_batch_cached(
+            &self.model,
+            self.config,
+            &self.spatial_cache,
+            positions,
+            &device,
+        )
     }
 
     #[cfg(feature = "training")]
@@ -201,6 +455,11 @@ impl PolicyValueNetwork {
         self.model = model_from_bytes(self.config, bytes, &NdArrayDevice::default())
             .expect("trained CPU record is compatible");
         self.training_steps += updates;
+        self.spatial_cache
+            .lock()
+            .expect("spatial cache lock")
+            .embeddings
+            .clear();
         metrics
     }
 
@@ -251,6 +510,7 @@ impl PolicyValueNetwork {
             model,
             config: checkpoint.config,
             training_steps: checkpoint.training_steps,
+            spatial_cache: Arc::new(Mutex::new(SpatialCache::default())),
         })
     }
 
@@ -261,17 +521,19 @@ impl PolicyValueNetwork {
     ///
     /// Returns an error if the backend-neutral model record cannot be transferred.
     /// Vulkan adapter and driver initialization failures are surfaced by Burn.
+    ///
+    /// # Panics
+    ///
+    /// Panics only if another thread poisons the internal spatial-cache lock.
     pub fn train_vulkan(
         &mut self,
+        device: &VulkanTrainingDevice,
         examples: &[TrainingExample],
         config: TrainConfig,
         rng: &mut impl Rng,
     ) -> Result<TrainMetrics, ModelError> {
         use burn::backend::Vulkan;
-        use burn::backend::wgpu::{RuntimeOptions, WgpuDevice, graphics, init_setup};
 
-        let device = WgpuDevice::default();
-        init_setup::<graphics::Vulkan>(&device, RuntimeOptions::default());
         let seed: u64 = rng.random();
         let bytes = record_bytes(self.model.clone())?;
         let (model, metrics, updates) = train_backend::<Autodiff<Vulkan>>(
@@ -280,11 +542,16 @@ impl PolicyValueNetwork {
             examples,
             config,
             seed,
-            &device,
+            &device.device,
         )?;
         let bytes = record_bytes(model)?;
         self.model = model_from_bytes(self.config, bytes, &NdArrayDevice::default())?;
         self.training_steps += updates;
+        self.spatial_cache
+            .lock()
+            .expect("spatial cache lock")
+            .embeddings
+            .clear();
         Ok(metrics)
     }
 }
@@ -299,6 +566,122 @@ impl PolicyValueEvaluator for PolicyValueNetwork {
     fn predict_batch(&self, positions: &[EncodedPosition]) -> Vec<Prediction> {
         self.predict_batch_cpu(positions)
     }
+}
+
+#[allow(clippy::too_many_lines)]
+fn predict_batch_cached<B: Backend>(
+    model: &MultiverseNet<B>,
+    config: NetworkConfig,
+    spatial_cache: &Mutex<SpatialCache>,
+    positions: &[EncodedPosition],
+    device: &B::Device,
+) -> Vec<Prediction> {
+    if positions.is_empty() {
+        return Vec::new();
+    }
+    let batch = BatchTensors::from_positions(positions, config.board_embedding, device);
+    let board_count = positions
+        .iter()
+        .map(|position| position.boards.len())
+        .max()
+        .unwrap_or(1)
+        .max(1);
+    let keys = positions
+        .iter()
+        .flat_map(|position| position.boards.iter().map(SpatialKey::from_board))
+        .collect::<Vec<_>>();
+    let mut resolved = HashMap::with_capacity(keys.len());
+    let mut missing_keys = Vec::new();
+    let mut missing_boards = Vec::new();
+    {
+        let mut cache = spatial_cache.lock().expect("spatial cache lock");
+        if cache.embeddings.len() >= SPATIAL_CACHE_LIMIT {
+            cache.embeddings.clear();
+        }
+        let mut seen_missing = HashSet::new();
+        for board in positions.iter().flat_map(|position| &position.boards) {
+            let key = SpatialKey::from_board(board);
+            if let Some(embedding) = cache.embeddings.get(&key).cloned() {
+                resolved.insert(key, embedding);
+                cache.hits += 1;
+            } else if seen_missing.insert(key) {
+                missing_keys.push(key);
+                missing_boards.push(board);
+                cache.misses += 1;
+            }
+        }
+    }
+    if !missing_boards.is_empty() {
+        let planes = missing_boards
+            .iter()
+            .flat_map(|board| board.planes.iter().copied())
+            .collect::<Vec<_>>();
+        let embeddings = model
+            .encode_spatial(Tensor::from_data(
+                TensorData::new(planes, [missing_boards.len(), BOARD_PLANES, 11, 11]),
+                device,
+            ))
+            .to_data()
+            .to_vec::<f32>()
+            .expect("spatial tensor uses f32");
+        for (index, key) in missing_keys.into_iter().enumerate() {
+            let start = index * config.board_embedding;
+            resolved.insert(
+                key,
+                embeddings[start..start + config.board_embedding].to_vec(),
+            );
+        }
+        let mut cache = spatial_cache.lock().expect("spatial cache lock");
+        if cache.embeddings.len() + resolved.len() > SPATIAL_CACHE_LIMIT {
+            cache.embeddings.clear();
+        }
+        let remaining = SPATIAL_CACHE_LIMIT.saturating_sub(cache.embeddings.len());
+        cache.embeddings.extend(
+            resolved
+                .iter()
+                .take(remaining)
+                .map(|(key, value)| (*key, value.clone())),
+        );
+    }
+    let mut spatial = vec![0.0; positions.len() * board_count * config.board_embedding];
+    let mut key_index = 0;
+    for (batch_index, position) in positions.iter().enumerate() {
+        for board_index in 0..position.boards.len() {
+            let embedding = resolved
+                .get(&keys[key_index])
+                .expect("every board embedding is resolved");
+            let start = (batch_index * board_count + board_index) * config.board_embedding;
+            spatial[start..start + config.board_embedding].copy_from_slice(embedding);
+            key_index += 1;
+        }
+    }
+    let spatial = Tensor::from_data(
+        TensorData::new(
+            spatial,
+            [positions.len(), board_count, config.board_embedding],
+        ),
+        device,
+    );
+    let output = model.forward_with_spatial(batch, spatial);
+    let action_count = output.logits.dims()[1];
+    let policies = softmax(output.logits, 1)
+        .to_data()
+        .to_vec::<f32>()
+        .expect("policy tensor uses f32");
+    let values = output
+        .value
+        .to_data()
+        .to_vec::<f32>()
+        .expect("value tensor uses f32");
+    positions
+        .iter()
+        .enumerate()
+        .map(|(row, position)| Prediction {
+            policy: policies[row * action_count..row * action_count + position.actions.len()]
+                .to_vec(),
+            value: values[row],
+        })
+        .collect()
 }
 
 fn record_bytes<B: Backend>(model: MultiverseNet<B>) -> Result<Vec<u8>, ModelError> {
@@ -461,6 +844,25 @@ mod tests {
         let after = PolicyValueNetwork::load(path).unwrap().predict(&position);
         assert_eq!(before.policy, after.policy);
         assert!((before.value - after.value).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn repeated_positions_reuse_cached_spatial_embeddings() {
+        let game = Game::new(Ruleset::Multiverse);
+        let position = encode(&game, &game.legal_actions());
+        let mut rng = ChaCha8Rng::seed_from_u64(9);
+        let network = PolicyValueNetwork::random(NetworkConfig::tiny(), &mut rng);
+
+        let _ = network.predict(&position);
+        let first = network.spatial_cache_stats();
+        let _ = network.predict_batch(&[position.clone(), position]);
+        let second = network.spatial_cache_stats();
+
+        assert_eq!(first.entries, 1);
+        assert_eq!(first.misses, 1);
+        assert_eq!(second.entries, 1);
+        assert_eq!(second.misses, first.misses);
+        assert!(second.hits >= first.hits + 2);
     }
 
     #[test]

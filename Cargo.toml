@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/alphazero",
+    "crates/benchmarks",
     "crates/core",
     "crates/neural",
     "crates/random-bot",

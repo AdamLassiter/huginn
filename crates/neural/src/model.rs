@@ -184,29 +184,47 @@ impl<B: Backend> MultiverseNet<B> {
     #[must_use]
     pub fn forward(&self, batch: BatchTensors<B>) -> ModelOutput<B> {
         let [batch_size, board_count, _, _, _] = batch.boards.dims();
-        let action_count = batch.actions.dims()[1];
-        let mut spatial = batch.boards.reshape([
-            batch_size * board_count,
-            BOARD_PLANES,
-            BOARD_SIZE,
-            BOARD_SIZE,
-        ]);
+        let spatial = self
+            .encode_spatial(batch.boards.clone().reshape([
+                batch_size * board_count,
+                BOARD_PLANES,
+                BOARD_SIZE,
+                BOARD_SIZE,
+            ]))
+            .reshape([batch_size, board_count, self.config.board_embedding]);
+        self.forward_with_spatial(batch, spatial)
+    }
+
+    /// Encodes immutable board planes independently of timeline metadata.
+    #[must_use]
+    pub fn encode_spatial(&self, boards: Tensor<B, 4>) -> Tensor<B, 2> {
+        let mut spatial = boards;
         spatial = gelu(self.stem_norm.forward(self.stem.forward(spatial)));
         for block in &self.residual {
             spatial = block.forward(spatial);
         }
         let spatial = spatial.mean_dim(3).mean_dim(2).squeeze_dims::<2>(&[2, 3]);
-        let spatial = self.spatial_embedding.forward(spatial);
+        self.spatial_embedding.forward(spatial)
+    }
+
+    /// Completes policy/value evaluation from cached spatial board embeddings.
+    #[must_use]
+    pub fn forward_with_spatial(
+        &self,
+        batch: BatchTensors<B>,
+        spatial: Tensor<B, 3>,
+    ) -> ModelOutput<B> {
+        let [batch_size, board_count, _] = spatial.dims();
+        let action_count = batch.actions.dims()[1];
         let metadata = self.metadata_embedding.forward(
             batch
                 .metadata
                 .reshape([batch_size * board_count, BOARD_METADATA_FEATURES]),
         );
-        let embeddings = gelu(spatial + metadata).reshape([
-            batch_size,
-            board_count,
-            self.config.board_embedding,
-        ]);
+        let embeddings = gelu(
+            spatial.reshape([batch_size * board_count, self.config.board_embedding]) + metadata,
+        )
+        .reshape([batch_size, board_count, self.config.board_embedding]);
 
         let board_mask = batch.board_mask.clone().unsqueeze_dim::<3>(2);
         let board_sum = (embeddings.clone() * board_mask.clone())

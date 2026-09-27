@@ -1,0 +1,15 @@
+[package]
+name = "huginn-benchmarks"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Repeatable release-mode throughput regression checks for Huginn"
+
+[dependencies]
+huginn-alphazero = { path = "../alphazero" }
+huginn-core = { path = "../core" }
+rand_chacha = "0.9"
+
+[lints]
+workspace = true

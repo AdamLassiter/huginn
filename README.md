@@ -136,14 +136,17 @@ trainer in Rust and uses a variable-action head so temporal moves do not require
 a finite, pre-enumerated move vocabulary.
 
 Muninn and Huginn learn from MCTS visit distributions and final self-play
-outcomes only. The network encodes every immutable board as attacker, defender,
-king, throne, and corner planes plus timeline metadata. A shared convolutional
-residual trunk embeds each board; masked mean/max pooling supplies multiverse
-context, and the policy head scores each legal action from that context and its
-source and destination board embeddings. Dynamically padded batches handle
-both classic positions and multiverse histories without a fixed maximum
-timeline or time coordinate. Version-2 replay files store compact authoritative
-trajectories in `replay-v2.bin.zst` and reconstruct positions for fitting.
+outcomes only. Classic positions encode the current board plus compact
+repetition state; they do not repeatedly convolve the complete move history.
+Multiverse positions encode every immutable board as attacker, defender, king,
+throne, and corner planes plus timeline metadata. A shared convolutional
+residual trunk embeds each board and caches immutable spatial embeddings;
+masked mean/max pooling supplies multiverse context, and the policy head scores
+each legal action from that context and its source and destination board
+embeddings. Dynamically padded batches handle multiverse histories without a
+fixed maximum timeline or time coordinate. Version-2 replay files store compact
+authoritative trajectories in `replay-v2.bin.zst` and reconstruct positions for
+fitting.
 
 Start or resume the default mixed-rules training loop with:
 
@@ -152,9 +155,16 @@ cargo run --release -p huginn-trainer -- \
   --work-dir models/training --ruleset both
 ```
 
-Independent self-play and arena games run concurrently. The default worker
-count is the logical CPU availability reported by the operating system through
-Rust's `available_parallelism()`; pass `--threads N` to override it.
+Independent self-play and arena games run concurrently. MCTS evaluates eight
+selected leaves per request by default, and the trainer merges requests from
+concurrent games into batches of up to 64 positions. Use
+`--mcts-batch-size` and `--inference-batch-size` to tune those limits. The
+default worker count is the logical CPU availability reported by the operating
+system through Rust's `available_parallelism()`; pass `--threads N` to override
+it. `--threads` is capacity rather than a promise of occupancy: with the
+default eight games, at most eight game tasks are runnable at once. Increase
+`--games` if you want a larger CPU to keep more game workers busy; startup logs
+this distinction explicitly.
 
 Each iteration generates noisy self-play games, appends them to a bounded replay
 window, trains a candidate, and evaluates it against the incumbent with colours
@@ -178,7 +188,7 @@ cargo run --release -p huginn-trainer -- \
   --work-dir models/training --ruleset both --arena-only
 ```
 
-### AMD GPU fitting on Windows
+### AMD GPU training and inference on Windows
 
 The trainer can fit the network through Burn's Vulkan backend on native
 Windows. This does not require ROCm: install a current AMD Adrenalin driver
@@ -191,6 +201,21 @@ directly from PowerShell without installing Rust:
   --training-device vulkan --model-size large
 ```
 
+The trainer initializes and verifies Vulkan before beginning self-play. With
+the default `--inference-device auto`, selecting `--training-device vulkan`
+also runs self-play and arena inference through Vulkan. A
+successful startup names the physical adapter and driver, followed by
+`Vulkan compute probe passed`; it rejects CPU, software-rendering, and
+non-Vulkan fallback adapters. On a multi-GPU system, select a different
+discrete adapter with `--gpu-index N`. Use `--inference-device cpu` to keep
+self-play and arena on the CPU while fitting on Vulkan. Check the packaged
+executable without starting a training iteration with:
+
+```powershell
+.\huginn-trainer.exe --training-device vulkan --gpu-index 0 `
+  --check-training-device
+```
+
 To build it locally instead, install Rust 1.92 or newer and run:
 
 ```powershell
@@ -199,12 +224,14 @@ cargo run --release -p huginn-trainer -- `
   --training-device vulkan --model-size large
 ```
 
-Self-play, MCTS, arena evaluation, the TUI, and the server still use CPU
-inference; `--training-device` selects only the fitting phase. Vulkan startup or
-device errors are reported and are never silently changed to CPU training. To
-fit an existing replay without generating games or running an arena, add
-`--fit-only`. The default `--batch-token-budget 262144` bounds padded board and
-action work; lower it if the driver reports an out-of-memory error.
+The TUI and server continue to use CPU inference. The trainer reports fitting
+and inference backends separately and never silently changes Vulkan to CPU.
+During training, messages beginning `self-play inference confirmed` and
+`arena inference confirmed` name the adapter after a full policy/value probe
+and synchronized readback have succeeded on it.
+To fit an existing replay immediately without generating games or running an
+arena, add `--fit-only`. The default `--batch-token-budget 262144` bounds padded
+board and action work; lower it if the driver reports an out-of-memory error.
 
 Version-1 `best.json` and `replay.json` files are left untouched because their
 hashed inputs and flat network are not compatible with this model. The trainer
@@ -225,6 +252,17 @@ cargo test --workspace --all-targets
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
 ```
+
+Run the deterministic release throughput gate locally with:
+
+```sh
+cargo run --release -p huginn-benchmarks -- --check
+```
+
+It verifies that classic encoding remains independent of history length, that
+immutable multiverse embeddings are reused, and that a fixed-seed large-model
+self-play workload stays above a conservative throughput floor. Both CI
+pipelines run the same command.
 
 The test suite covers the initial setup, Copenhagen movement and capture rules,
 special wins, multiverse staging and activity, temporal and timeline captures,

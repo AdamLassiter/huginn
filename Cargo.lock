@@ -2985,6 +2985,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "huginn-benchmarks"
+version = "0.2.0"
+dependencies = [
+ "huginn-alphazero",
+ "huginn-core",
+ "rand_chacha 0.9.0",
+]
+
+[[package]]
 name = "huginn-core"
 version = "0.2.0"
 dependencies = [
@@ -3000,6 +3009,7 @@ version = "0.2.0"
 dependencies = [
  "base64 0.22.1",
  "burn",
+ "cubecl-common",
  "huginn-core",
  "rand 0.9.5",
  "rand_chacha 0.9.0",
@@ -3007,6 +3017,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror 2.0.20",
+ "wgpu",
 ]
 
 [[package]]

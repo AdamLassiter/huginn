@@ -33,6 +33,9 @@ jobs:
       - name: Run tests
         run: cargo test --workspace --all-targets --locked
 
+      - name: Run release throughput regression check
+        run: cargo run --release --locked -p huginn-benchmarks -- --check
+
   trainer-artifacts:
     name: Trainer artifact (${{ matrix.platform }})
     needs: test

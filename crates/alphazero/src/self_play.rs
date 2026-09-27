@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::encoding::encode;
-use crate::network::{PolicyValueNetwork, TrainingExample};
+use crate::network::{PolicyValueEvaluator, PolicyValueNetwork, TrainingExample};
 use crate::search::{Mcts, SearchConfig};
 
 #[derive(Clone, Copy, Debug)]
@@ -126,8 +126,8 @@ pub enum ReplayError {
 }
 
 #[must_use]
-pub fn play_self_play_game(
-    model: &PolicyValueNetwork,
+pub fn play_self_play_game<E: PolicyValueEvaluator + ?Sized>(
+    model: &E,
     ruleset: Ruleset,
     config: SelfPlayConfig,
     rng: &mut impl Rng,
@@ -276,9 +276,9 @@ pub fn run_arena_schedule_with_progress(
 }
 
 #[must_use]
-pub fn play_arena_game(
-    candidate: &PolicyValueNetwork,
-    incumbent: &PolicyValueNetwork,
+pub fn play_arena_game<E: PolicyValueEvaluator + ?Sized>(
+    candidate: &E,
+    incumbent: &E,
     config: ArenaGameConfig,
     rng: &mut impl Rng,
     mut progress: impl FnMut(usize, Option<GameOutcome>),

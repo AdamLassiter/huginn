@@ -1,6 +1,8 @@
 use std::collections::BTreeMap;
 
-use huginn_core::{BOARD_SIZE, BoardCoordinate, Game, Piece, PlayerAction, Side, Square, Timeline};
+use huginn_core::{
+    BOARD_SIZE, BoardCoordinate, Game, Piece, PlayerAction, Ruleset, Side, Square, Timeline,
+};
 use serde::{Deserialize, Serialize};
 
 pub const BOARD_PLANES: usize = 5;
@@ -41,20 +43,43 @@ pub fn encode(game: &Game, actions: &[PlayerAction]) -> EncodedPosition {
         .iter()
         .filter(|timeline| game.is_active_timeline(timeline.row))
         .count();
+    let (timeline_feature, activity_feature) = match game.ruleset() {
+        Ruleset::Classic => classic_repetition_features(&timelines),
+        Ruleset::Multiverse => (
+            (timelines.len() as f32).ln_1p() / 4.0,
+            (active_count as f32).ln_1p() / 4.0,
+        ),
+    };
+    let encoded_board_count = if game.ruleset() == Ruleset::Classic {
+        usize::from(board_count > 0)
+    } else {
+        board_count
+    };
     let global = [
         side_sign(game.turn()),
-        f32::from(game.ruleset() == huginn_core::Ruleset::Multiverse),
+        f32::from(game.ruleset() == Ruleset::Multiverse),
         f32::from(game.can_submit()),
         f32::from(game.has_staged_moves()),
         bounded(present),
-        (board_count as f32).ln_1p() / 6.0,
-        (timelines.len() as f32).ln_1p() / 4.0,
-        (active_count as f32).ln_1p() / 4.0,
+        (encoded_board_count as f32).ln_1p() / 6.0,
+        timeline_feature,
+        activity_feature,
     ];
 
-    let mut boards = Vec::with_capacity(board_count);
-    for timeline in timelines {
-        encode_timeline(game, timeline, present, &mut boards);
+    let encoded_capacity = if game.ruleset() == Ruleset::Classic {
+        1
+    } else {
+        board_count
+    };
+    let mut boards = Vec::with_capacity(encoded_capacity);
+    for timeline in &timelines {
+        encode_timeline(
+            game,
+            timeline,
+            present,
+            game.ruleset() == Ruleset::Classic,
+            &mut boards,
+        );
     }
     let indices = boards
         .iter()
@@ -73,10 +98,37 @@ pub fn encode(game: &Game, actions: &[PlayerAction]) -> EncodedPosition {
     }
 }
 
-fn encode_timeline(game: &Game, timeline: &Timeline, present: i32, output: &mut Vec<EncodedBoard>) {
+fn classic_repetition_features(timelines: &[&Timeline]) -> (f32, f32) {
+    let Some(latest) = timelines.first().and_then(|timeline| timeline.latest()) else {
+        return (0.0, 0.0);
+    };
+    let previous_matches = timelines
+        .first()
+        .into_iter()
+        .flat_map(|timeline| timeline.boards.values())
+        .filter(|snapshot| {
+            snapshot.coordinate != latest.coordinate && snapshot.board == latest.board
+        })
+        .count();
+    (
+        f32::from(previous_matches > 0),
+        (previous_matches as f32).ln_1p() / 4.0,
+    )
+}
+
+fn encode_timeline(
+    game: &Game,
+    timeline: &Timeline,
+    present: i32,
+    latest_only: bool,
+    output: &mut Vec<EncodedBoard>,
+) {
     let latest = timeline.latest().map(|board| board.coordinate);
     let active = game.is_active_timeline(timeline.row);
     for snapshot in timeline.boards.values() {
+        if latest_only && Some(snapshot.coordinate) != latest {
+            continue;
+        }
         let mut planes = vec![0.0; BOARD_PLANES * BOARD_SIZE * BOARD_SIZE];
         for y in 0..BOARD_SIZE {
             for x in 0..BOARD_SIZE {
@@ -214,6 +266,34 @@ mod tests {
         assert_eq!(encoded.boards.len(), 1);
         assert_eq!(encoded.boards[0].planes.len(), BOARD_PLANES * 121);
         assert_eq!(encoded.actions.len(), actions.len());
+        assert!(encoded.actions.iter().all(|action| {
+            action.source_board == Some(0) && action.destination_board == Some(0)
+        }));
+    }
+
+    #[test]
+    fn classic_encoding_keeps_only_the_current_board_and_compact_repetition_state() {
+        let mut game = Game::new(Ruleset::Classic);
+        for _ in 0..8 {
+            let action = game.legal_actions()[0];
+            game.apply_action(action).expect("legal action");
+        }
+        let history_len = game
+            .timelines()
+            .next()
+            .expect("classic timeline")
+            .boards
+            .len();
+        assert_eq!(history_len, 9);
+
+        let actions = game.legal_actions();
+        let encoded = encode(&game, &actions);
+        assert_eq!(encoded.boards.len(), 1);
+        assert_eq!(
+            encoded.boards[0].coordinate,
+            game.latest_coordinate(0).unwrap()
+        );
+        assert!((encoded.global[5] - 2.0_f32.ln() / 6.0).abs() < f32::EPSILON);
         assert!(encoded.actions.iter().all(|action| {
             action.source_board == Some(0) && action.destination_board == Some(0)
         }));

@@ -10,16 +10,18 @@ description = "Backend-neutral multiverse policy/value model for Huginn"
 default = ["cpu", "training"]
 cpu = ["burn/ndarray"]
 training = ["burn/autodiff"]
-vulkan = ["burn/vulkan"]
+vulkan = ["burn/vulkan", "dep:cubecl-common", "dep:wgpu"]
 
 [dependencies]
 base64 = "0.22"
 burn = { version = "=0.21.0", default-features = false, features = ["std"] }
+cubecl-common = { version = "=0.10.0", features = ["std"], optional = true }
 huginn-core = { path = "../core" }
 rand = "0.9"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
+wgpu = { version = "29", default-features = false, optional = true }
 
 [dev-dependencies]
 rand_chacha = "0.9"
