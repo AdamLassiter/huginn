@@ -114,7 +114,7 @@ mod tests {
         let decoded: GameView = serde_json::from_str(&encoded).expect("deserialize view");
         assert_eq!(decoded.turn, Side::Attacker);
         assert_eq!(decoded.timelines.len(), 1);
-        assert!(!decoded.legal_moves.is_empty());
+        assert_ne!(decoded.legal_moves, vec![]);
     }
 
     #[test]
