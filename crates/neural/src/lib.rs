@@ -12,8 +12,9 @@ pub use encoding::{
 };
 pub use model::{BatchTensors, ModelOutput, ModelSize, MultiverseNet, NetworkConfig};
 pub use network::{
-    ModelError, PolicyValueEvaluator, PolicyValueNetwork, Prediction, TrainConfig, TrainMetrics,
-    TrainingExample,
+    BatchMemoryEstimate, ModelError, PolicyValueEvaluator, PolicyValueNetwork, Prediction,
+    TrainConfig, TrainMetrics, TrainingExample, estimate_batch_memory_from_shape,
+    estimate_inference_batch_memory, estimate_training_batch_memory,
 };
 #[cfg(all(feature = "training", feature = "vulkan"))]
 pub use network::{VulkanDeviceInfo, VulkanPolicyValueEvaluator, VulkanTrainingDevice};

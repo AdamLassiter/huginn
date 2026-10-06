@@ -1,8 +1,11 @@
-use std::fs;
+use std::collections::HashSet;
+use std::fs::{self, File};
+use std::io::{BufReader, BufWriter, Write};
 use std::path::Path;
 
 use huginn_core::{Game, GameOutcome, PlayerAction, Ruleset, Side};
 use rand::Rng;
+use rand::seq::SliceRandom;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -58,6 +61,13 @@ struct ReplayGame {
 pub struct ReplayBuffer {
     format_version: u32,
     games: Vec<ReplayGame>,
+}
+
+#[derive(Debug)]
+pub struct SampledReplay {
+    pub examples: Vec<TrainingExample>,
+    pub estimated_bytes: usize,
+    pub skipped_for_memory: usize,
 }
 
 impl Default for ReplayBuffer {
@@ -123,6 +133,13 @@ pub enum ReplayError {
     Version(u32),
     #[error("replay trajectory is invalid: {0}")]
     Trajectory(String),
+    #[error(
+        "a replay position cannot fit the reconstruction memory budget: estimated={estimated_mib} MiB, budget={budget_mib} MiB"
+    )]
+    MemoryBudget {
+        estimated_mib: usize,
+        budget_mib: usize,
+    },
 }
 
 #[must_use]
@@ -327,10 +344,48 @@ impl ReplayBuffer {
     ///
     /// Returns an error if a stored policy/action no longer matches authoritative rules.
     pub fn examples(&self) -> Result<Vec<TrainingExample>, ReplayError> {
-        let mut examples = Vec::with_capacity(self.len());
+        let mut rng = rand::rng();
+        Ok(self
+            .sample_examples(self.len(), usize::MAX, &mut rng)?
+            .examples)
+    }
+
+    /// Reconstructs a random, host-memory-bounded sample of replay positions.
+    /// Every trajectory is still validated in full.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid trajectories or when one selected position
+    /// cannot fit the memory budget by itself.
+    pub fn sample_examples(
+        &self,
+        max_examples: usize,
+        max_bytes: usize,
+        rng: &mut impl Rng,
+    ) -> Result<SampledReplay, ReplayError> {
+        let mut selected = (0..self.len()).collect::<Vec<_>>();
+        selected.shuffle(rng);
+        selected.truncate(max_examples.min(selected.len()));
+        let mut selected = selected.into_iter().collect::<HashSet<_>>();
+        let mut game_order = (0..self.games.len()).collect::<Vec<_>>();
+        if max_examples < self.len() || max_bytes != usize::MAX {
+            game_order.shuffle(rng);
+        }
+        let mut game_offsets = Vec::with_capacity(self.games.len());
+        let mut offset = 0_usize;
         for replay in &self.games {
+            game_offsets.push(offset);
+            offset = offset.saturating_add(replay.steps.len());
+        }
+        let mut examples = Vec::with_capacity(max_examples.min(self.len()));
+        let mut estimated_bytes = 0_usize;
+        let mut skipped_for_memory = 0_usize;
+        let mut smallest_rejected = usize::MAX;
+        for game_index in game_order {
+            let replay = &self.games[game_index];
             let mut game = Game::new(replay.ruleset);
             for (index, step) in replay.steps.iter().enumerate() {
+                let global_index = game_offsets[game_index].saturating_add(index);
                 let actions = game.legal_actions();
                 if actions.len() != step.policy.len() {
                     return Err(ReplayError::Trajectory(format!(
@@ -344,20 +399,39 @@ impl ReplayBuffer {
                         "step {index} selects an action that is no longer legal"
                     )));
                 }
-                let side = game.turn();
-                examples.push(TrainingExample {
-                    position: encode(&game, &actions),
-                    policy: step.policy.clone(),
-                    value: replay.outcome.map_or(0.0, |outcome| {
-                        if outcome.winner == side { 1.0 } else { -1.0 }
-                    }),
-                });
+                if selected.remove(&global_index) {
+                    let estimate = estimate_example_bytes(&game, actions.len());
+                    if estimated_bytes.saturating_add(estimate) <= max_bytes {
+                        let side = game.turn();
+                        examples.push(TrainingExample {
+                            position: encode(&game, &actions),
+                            policy: step.policy.clone(),
+                            value: replay.outcome.map_or(0.0, |outcome| {
+                                if outcome.winner == side { 1.0 } else { -1.0 }
+                            }),
+                        });
+                        estimated_bytes = estimated_bytes.saturating_add(estimate);
+                    } else {
+                        skipped_for_memory += 1;
+                        smallest_rejected = smallest_rejected.min(estimate);
+                    }
+                }
                 game.apply_action(step.action).map_err(|error| {
                     ReplayError::Trajectory(format!("step {index} cannot be applied: {error}"))
                 })?;
             }
         }
-        Ok(examples)
+        if examples.is_empty() && skipped_for_memory > 0 {
+            return Err(ReplayError::MemoryBudget {
+                estimated_mib: bytes_to_mib_ceil(smallest_rejected),
+                budget_mib: bytes_to_mib_ceil(max_bytes),
+            });
+        }
+        Ok(SampledReplay {
+            examples,
+            estimated_bytes,
+            skipped_for_memory,
+        })
     }
 
     pub fn extend_game(&mut self, game: SelfPlayGame, capacity: usize) {
@@ -384,10 +458,12 @@ impl ReplayBuffer {
             fs::create_dir_all(parent)?;
         }
         let temporary = path.with_extension("zst.tmp");
-        let bytes =
-            rmp_serde::to_vec_named(self).map_err(|error| ReplayError::Codec(error.to_string()))?;
-        let compressed = zstd::stream::encode_all(bytes.as_slice(), 3)?;
-        fs::write(&temporary, compressed)?;
+        let writer = BufWriter::new(File::create(&temporary)?);
+        let mut encoder = zstd::stream::write::Encoder::new(writer, 3)?;
+        rmp_serde::encode::write_named(&mut encoder, self)
+            .map_err(|error| ReplayError::Codec(error.to_string()))?;
+        let mut writer = encoder.finish()?;
+        writer.flush()?;
         fs::rename(temporary, path)?;
         Ok(())
     }
@@ -398,15 +474,35 @@ impl ReplayBuffer {
     ///
     /// Returns an error if the source cannot be read or decoded.
     pub fn load(path: impl AsRef<Path>) -> Result<Self, ReplayError> {
-        let compressed = fs::read(path)?;
-        let bytes = zstd::stream::decode_all(compressed.as_slice())?;
+        let reader = BufReader::new(File::open(path)?);
+        let decoder = zstd::stream::read::Decoder::new(reader)?;
         let replay: Self =
-            rmp_serde::from_slice(&bytes).map_err(|error| ReplayError::Codec(error.to_string()))?;
+            rmp_serde::from_read(decoder).map_err(|error| ReplayError::Codec(error.to_string()))?;
         if replay.format_version != 2 {
             return Err(ReplayError::Version(replay.format_version));
         }
         Ok(replay)
     }
+}
+
+fn estimate_example_bytes(game: &Game, actions: usize) -> usize {
+    let boards = if game.ruleset() == Ruleset::Classic {
+        1
+    } else {
+        game.timelines()
+            .map(|timeline| timeline.boards.len())
+            .sum::<usize>()
+            .max(1)
+    };
+    // Deliberately includes allocator/Vec overhead above the serialized f32 data.
+    boards
+        .saturating_mul(4 * 1024)
+        .saturating_add(actions.saturating_mul(192))
+        .saturating_add(1024)
+}
+
+const fn bytes_to_mib_ceil(bytes: usize) -> usize {
+    bytes.saturating_add(1024 * 1024 - 1) / (1024 * 1024)
 }
 
 #[cfg(test)]
@@ -473,6 +569,32 @@ mod tests {
         let loaded = ReplayBuffer::load(path).unwrap();
         assert_eq!(loaded.len(), 2);
         assert_eq!(loaded.examples().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn replay_sampling_bounds_expanded_positions_and_host_memory() {
+        let game = Game::new(Ruleset::Classic);
+        let actions = game.legal_actions();
+        let replay_game = SelfPlayGame {
+            ruleset: Ruleset::Classic,
+            steps: vec![ReplayStep {
+                action: actions[0],
+                policy: vec![1.0 / actions.len() as f32; actions.len()],
+            }],
+            outcome: None,
+            truncated: true,
+        };
+        let mut replay = ReplayBuffer::default();
+        replay.extend_game(replay_game.clone(), 10);
+        replay.extend_game(replay_game, 10);
+        let mut rng = ChaCha8Rng::seed_from_u64(41);
+
+        let sample = replay.sample_examples(1, 1024 * 1024, &mut rng).unwrap();
+        assert_eq!(sample.examples.len(), 1);
+        assert!(sample.estimated_bytes <= 1024 * 1024);
+
+        let error = replay.sample_examples(1, 1, &mut rng).unwrap_err();
+        assert!(matches!(error, ReplayError::MemoryBudget { .. }));
     }
 
     #[test]

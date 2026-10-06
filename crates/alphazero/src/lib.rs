@@ -25,11 +25,12 @@ pub use huginn_neural::{
     ACTION_FEATURES, BOARD_METADATA_FEATURES, BOARD_PLANES, EncodedAction, EncodedBoard,
     EncodedPosition, GLOBAL_FEATURES, ModelError, ModelSize, NetworkConfig, PolicyValueEvaluator,
     PolicyValueNetwork, Prediction, TrainConfig, TrainMetrics, TrainingExample, encode,
-    encode_action,
+    encode_action, estimate_batch_memory_from_shape, estimate_inference_batch_memory,
+    estimate_training_batch_memory,
 };
 pub use search::{Mcts, SearchConfig, SearchResult};
 pub use self_play::{
     ArenaGameConfig, ArenaGameResult, ArenaProgress, ArenaReport, ReplayBuffer, ReplayError,
-    ReplayStep, SelfPlayConfig, SelfPlayGame, play_arena_game, play_self_play_game, run_arena,
-    run_arena_schedule, run_arena_schedule_with_progress,
+    ReplayStep, SampledReplay, SelfPlayConfig, SelfPlayGame, play_arena_game, play_self_play_game,
+    run_arena, run_arena_schedule, run_arena_schedule_with_progress,
 };

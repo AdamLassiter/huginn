@@ -24,7 +24,8 @@ use burn::optim::{AdamConfig, GradientsParams, Optimizer, decay::WeightDecayConf
 use burn::tensor::backend::AutodiffBackend;
 
 use crate::{
-    BOARD_PLANES, BatchTensors, EncodedBoard, EncodedPosition, MultiverseNet, NetworkConfig,
+    ACTION_FEATURES, BOARD_METADATA_FEATURES, BOARD_PLANES, BatchTensors, EncodedBoard,
+    EncodedPosition, MultiverseNet, NetworkConfig,
 };
 
 const FORMAT_VERSION: u32 = 2;
@@ -57,6 +58,8 @@ pub struct TrainConfig {
     pub epochs: usize,
     pub batch_size: usize,
     pub batch_token_budget: usize,
+    /// Conservative upper bound for the dynamic tensors in one padded batch.
+    pub batch_memory_budget_bytes: usize,
     pub learning_rate: f32,
     pub l2: f32,
 }
@@ -67,6 +70,7 @@ impl Default for TrainConfig {
             epochs: 4,
             batch_size: 64,
             batch_token_budget: 262_144,
+            batch_memory_budget_bytes: 4096 * 1024 * 1024,
             learning_rate: 0.001,
             l2: 0.0001,
         }
@@ -78,6 +82,14 @@ pub struct TrainMetrics {
     pub policy_loss: f32,
     pub value_loss: f32,
     pub examples: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BatchMemoryEstimate {
+    pub batch_size: usize,
+    pub max_boards: usize,
+    pub max_actions: usize,
+    pub bytes: usize,
 }
 
 #[derive(Debug)]
@@ -121,6 +133,97 @@ struct SpatialCache {
     misses: u64,
 }
 
+/// Estimates the padded inference working set for a collection of positions.
+#[must_use]
+pub fn estimate_inference_batch_memory(
+    positions: &[EncodedPosition],
+    config: NetworkConfig,
+) -> BatchMemoryEstimate {
+    let (max_boards, max_actions) = batch_dimensions(positions);
+    estimate_batch_memory_from_shape(positions.len(), max_boards, max_actions, config, false)
+}
+
+/// Estimates the padded training working set for a collection of positions.
+#[must_use]
+pub fn estimate_training_batch_memory(
+    positions: &[EncodedPosition],
+    config: NetworkConfig,
+) -> BatchMemoryEstimate {
+    let (max_boards, max_actions) = batch_dimensions(positions);
+    estimate_batch_memory_from_shape(positions.len(), max_boards, max_actions, config, true)
+}
+
+/// Estimates a padded network batch from dimensions without materializing it.
+#[must_use]
+pub fn estimate_batch_memory_from_shape(
+    batch_size: usize,
+    max_boards: usize,
+    max_actions: usize,
+    config: NetworkConfig,
+    training: bool,
+) -> BatchMemoryEstimate {
+    let batch_size = batch_size.max(1);
+    let max_boards = max_boards.max(1);
+    let max_actions = max_actions.max(1);
+    let padded_boards = batch_size.saturating_mul(max_boards);
+    let padded_actions = batch_size.saturating_mul(max_actions);
+
+    // Includes input tensors, convolution/residual intermediates, gathered board
+    // embeddings, action-head intermediates, and a conservative autodiff margin.
+    // The two i64 gather-index tensors are accounted for explicitly.
+    let board_channel_copies = if training {
+        12_usize.saturating_add(config.residual_blocks.saturating_mul(12))
+    } else {
+        4_usize.saturating_add(config.residual_blocks.saturating_mul(3))
+    };
+    let board_values = BOARD_PLANES
+        .saturating_mul(121)
+        .saturating_add(BOARD_METADATA_FEATURES)
+        .saturating_add(config.board_embedding)
+        .saturating_add(
+            121_usize
+                .saturating_mul(config.channels)
+                .saturating_mul(board_channel_copies),
+        );
+    let action_values = ACTION_FEATURES
+        .saturating_add(config.board_embedding.saturating_mul(5))
+        .saturating_add(config.context_width.saturating_mul(3))
+        .saturating_add(
+            config
+                .action_width
+                .saturating_mul(if training { 8 } else { 3 }),
+        );
+    let board_bytes = padded_boards.saturating_mul(board_values).saturating_mul(4);
+    let action_float_bytes = padded_actions
+        .saturating_mul(action_values)
+        .saturating_mul(4);
+    let gather_index_bytes = padded_actions
+        .saturating_mul(config.board_embedding)
+        .saturating_mul(2)
+        .saturating_mul(8);
+    let masks_and_targets = padded_actions.saturating_mul(if training { 16 } else { 8 });
+    BatchMemoryEstimate {
+        batch_size,
+        max_boards,
+        max_actions,
+        bytes: board_bytes
+            .saturating_add(action_float_bytes)
+            .saturating_add(gather_index_bytes)
+            .saturating_add(masks_and_targets),
+    }
+}
+
+fn batch_dimensions(positions: &[EncodedPosition]) -> (usize, usize) {
+    positions
+        .iter()
+        .fold((1, 1), |(boards, actions), position| {
+            (
+                boards.max(position.boards.len()),
+                actions.max(position.actions.len()),
+            )
+        })
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[doc(hidden)]
 pub struct SpatialCacheStats {
@@ -143,9 +246,21 @@ pub enum ModelError {
     Version(u32),
     #[error("checkpoint architecture does not match its declared configuration")]
     Shape,
+    #[error(
+        "one training position exceeds the batch memory budget: boards={boards}, actions={actions}, estimated={estimated_mib} MiB, budget={budget_mib} MiB"
+    )]
+    BatchMemoryLimit {
+        boards: usize,
+        actions: usize,
+        estimated_mib: usize,
+        budget_mib: usize,
+    },
     #[cfg(all(feature = "training", feature = "vulkan"))]
     #[error("Vulkan training device initialization failed: {0}")]
     VulkanInitialization(String),
+    #[cfg(all(feature = "training", feature = "vulkan"))]
+    #[error("Vulkan training failed: {0}")]
+    VulkanExecution(String),
 }
 
 #[cfg(all(feature = "training", feature = "vulkan"))]
@@ -431,17 +546,22 @@ impl PolicyValueNetwork {
     #[cfg(feature = "training")]
     /// Fits examples with the CPU autodiff backend.
     ///
+    /// # Errors
+    ///
+    /// Returns an error if the record cannot be transferred or a position exceeds
+    /// the configured batch memory budget.
+    ///
     /// # Panics
     ///
-    /// Panics only if Burn cannot round-trip its own in-memory model record.
+    /// Panics only if another thread poisons the internal spatial-cache lock.
     pub fn train(
         &mut self,
         examples: &[TrainingExample],
         config: TrainConfig,
         rng: &mut impl Rng,
-    ) -> TrainMetrics {
+    ) -> Result<TrainMetrics, ModelError> {
         let seed: u64 = rng.random();
-        let bytes = record_bytes(self.model.clone()).expect("in-memory CPU record");
+        let bytes = record_bytes(self.model.clone())?;
         let (model, metrics, updates) = train_backend::<Autodiff<CpuBackend>>(
             &bytes,
             self.config,
@@ -449,18 +569,16 @@ impl PolicyValueNetwork {
             config,
             seed,
             &NdArrayDevice::default(),
-        )
-        .expect("CPU training record is compatible");
-        let bytes = record_bytes(model).expect("in-memory trained CPU record");
-        self.model = model_from_bytes(self.config, bytes, &NdArrayDevice::default())
-            .expect("trained CPU record is compatible");
+        )?;
+        let bytes = record_bytes(model)?;
+        self.model = model_from_bytes(self.config, bytes, &NdArrayDevice::default())?;
         self.training_steps += updates;
         self.spatial_cache
             .lock()
             .expect("spatial cache lock")
             .embeddings
             .clear();
-        metrics
+        Ok(metrics)
     }
 
     /// Saves a versioned JSON manifest containing a backend-neutral full-precision record.
@@ -536,14 +654,18 @@ impl PolicyValueNetwork {
 
         let seed: u64 = rng.random();
         let bytes = record_bytes(self.model.clone())?;
-        let (model, metrics, updates) = train_backend::<Autodiff<Vulkan>>(
-            &bytes,
-            self.config,
-            examples,
-            config,
-            seed,
-            &device.device,
-        )?;
+        let trained = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            train_backend::<Autodiff<Vulkan>>(
+                &bytes,
+                self.config,
+                examples,
+                config,
+                seed,
+                &device.device,
+            )
+        }))
+        .map_err(|payload| ModelError::VulkanExecution(panic_message(payload.as_ref())))?;
+        let (model, metrics, updates) = trained?;
         let bytes = record_bytes(model)?;
         self.model = model_from_bytes(self.config, bytes, &NdArrayDevice::default())?;
         self.training_steps += updates;
@@ -728,9 +850,10 @@ fn train_backend<AB: AutodiffBackend>(
     let mut updates = 0_u64;
     for _ in 0..config.epochs {
         order.shuffle(&mut random);
+        order.sort_by_key(|&index| shape_bucket(&examples[index].position));
         let mut cursor = 0;
         while cursor < order.len() {
-            let end = choose_batch_end(examples, &order, cursor, config);
+            let end = choose_batch_end(examples, &order, cursor, config, network_config)?;
             let selected = order[cursor..end]
                 .iter()
                 .map(|&index| &examples[index])
@@ -787,22 +910,54 @@ fn choose_batch_end(
     order: &[usize],
     start: usize,
     config: TrainConfig,
-) -> usize {
+    network_config: NetworkConfig,
+) -> Result<usize, ModelError> {
     let maximum = (start + config.batch_size.max(1)).min(order.len());
     let mut end = start;
-    let mut boards = 0_usize;
-    let mut actions = 0_usize;
+    let mut max_boards = 1_usize;
+    let mut max_actions = 1_usize;
     while end < maximum {
         let position = &examples[order[end]].position;
-        let cost = position.boards.len() * 121 + position.actions.len();
-        if end > start && boards + actions + cost > config.batch_token_budget.max(1) {
+        let candidate_size = end - start + 1;
+        max_boards = max_boards.max(position.boards.len());
+        max_actions = max_actions.max(position.actions.len());
+        let padded_tokens = candidate_size
+            .saturating_mul(max_boards.saturating_mul(121).saturating_add(max_actions));
+        let memory = estimate_batch_memory_from_shape(
+            candidate_size,
+            max_boards,
+            max_actions,
+            network_config,
+            true,
+        );
+        let exceeds_tokens = padded_tokens > config.batch_token_budget.max(1);
+        let exceeds_memory = memory.bytes > config.batch_memory_budget_bytes.max(1);
+        if end == start && exceeds_memory {
+            return Err(ModelError::BatchMemoryLimit {
+                boards: max_boards,
+                actions: max_actions,
+                estimated_mib: bytes_to_mib_ceil(memory.bytes),
+                budget_mib: bytes_to_mib_ceil(config.batch_memory_budget_bytes.max(1)),
+            });
+        }
+        if end > start && (exceeds_tokens || exceeds_memory) {
             break;
         }
-        boards += position.boards.len() * 121;
-        actions += position.actions.len();
         end += 1;
     }
-    end.max(start + 1)
+    Ok(end.max(start + 1))
+}
+
+#[cfg(feature = "training")]
+fn shape_bucket(position: &EncodedPosition) -> (usize, usize) {
+    (
+        position.boards.len().max(1).next_power_of_two(),
+        position.actions.len().max(1).next_power_of_two(),
+    )
+}
+
+const fn bytes_to_mib_ceil(bytes: usize) -> usize {
+    bytes.saturating_add(1024 * 1024 - 1) / (1024 * 1024)
 }
 
 #[cfg(feature = "training")]
@@ -877,18 +1032,76 @@ mod tests {
         };
         let mut rng = ChaCha8Rng::seed_from_u64(11);
         let mut network = PolicyValueNetwork::random(NetworkConfig::tiny(), &mut rng);
-        let metrics = network.train(
-            &[example],
-            TrainConfig {
-                epochs: 1,
-                batch_size: 1,
-                ..TrainConfig::default()
-            },
-            &mut rng,
-        );
+        let metrics = network
+            .train(
+                &[example],
+                TrainConfig {
+                    epochs: 1,
+                    batch_size: 1,
+                    ..TrainConfig::default()
+                },
+                &mut rng,
+            )
+            .unwrap();
         assert_eq!(metrics.examples, 1);
         assert!(metrics.policy_loss.is_finite());
         assert!(metrics.value_loss.is_finite());
         assert_eq!(network.training_steps(), 1);
+    }
+
+    #[test]
+    fn padded_memory_budget_splits_training_batches_before_allocation() {
+        let game = Game::new(Ruleset::Classic);
+        let position = encode(&game, &game.legal_actions());
+        let policy = vec![1.0; position.actions.len()];
+        let examples = vec![
+            TrainingExample {
+                position: position.clone(),
+                policy: policy.clone(),
+                value: 0.0,
+            },
+            TrainingExample {
+                position,
+                policy,
+                value: 0.0,
+            },
+        ];
+        let network_config = NetworkConfig::tiny();
+        let single = estimate_training_batch_memory(
+            std::slice::from_ref(&examples[0].position),
+            network_config,
+        );
+        let pair = estimate_training_batch_memory(
+            &[examples[0].position.clone(), examples[1].position.clone()],
+            network_config,
+        );
+        assert!(pair.bytes > single.bytes);
+        let end = choose_batch_end(
+            &examples,
+            &[0, 1],
+            0,
+            TrainConfig {
+                batch_size: 2,
+                batch_token_budget: usize::MAX,
+                batch_memory_budget_bytes: pair.bytes - 1,
+                ..TrainConfig::default()
+            },
+            network_config,
+        )
+        .unwrap();
+        assert_eq!(end, 1);
+
+        let error = choose_batch_end(
+            &examples,
+            &[0, 1],
+            0,
+            TrainConfig {
+                batch_memory_budget_bytes: single.bytes - 1,
+                ..TrainConfig::default()
+            },
+            network_config,
+        )
+        .unwrap_err();
+        assert!(matches!(error, ModelError::BatchMemoryLimit { .. }));
     }
 }

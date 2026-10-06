@@ -8,7 +8,8 @@ use clap::{Parser, ValueEnum};
 use huginn_alphazero::{
     ArenaGameConfig, ArenaReport, EncodedPosition, ModelSize, NetworkConfig, PolicyValueEvaluator,
     PolicyValueNetwork, Prediction, ReplayBuffer, SearchConfig, SelfPlayConfig, SelfPlayGame,
-    TrainConfig, play_arena_game, play_self_play_game,
+    TrainConfig, estimate_batch_memory_from_shape, estimate_inference_batch_memory,
+    estimate_training_batch_memory, play_arena_game, play_self_play_game,
 };
 use huginn_core::{Ruleset, Side};
 use huginn_neural::VulkanTrainingDevice;
@@ -76,6 +77,9 @@ struct Arguments {
     /// Positions merged from concurrent games into one network inference batch.
     #[arg(long, default_value_t = 64)]
     inference_batch_size: usize,
+    /// Conservative dynamic-tensor budget for one inference batch, in MiB.
+    #[arg(long, default_value_t = 1024)]
+    inference_memory_budget_mib: usize,
     #[arg(long, default_value_t = 4)]
     arena_games: usize,
     #[arg(long, default_value_t = 25)]
@@ -100,6 +104,15 @@ struct Arguments {
     /// Approximate padded board/action elements allowed in one fitting batch.
     #[arg(long, default_value_t = 262_144)]
     batch_token_budget: usize,
+    /// Conservative dynamic-tensor budget for one fitting batch, in MiB.
+    #[arg(long, default_value_t = 4096)]
+    training_memory_budget_mib: usize,
+    /// Maximum expanded replay positions fitted in one iteration.
+    #[arg(long, default_value_t = 20_000)]
+    training_examples: usize,
+    /// Host-memory budget for expanded replay positions, in MiB.
+    #[arg(long, default_value_t = 4096)]
+    reconstruction_memory_budget_mib: usize,
     #[arg(long, default_value_t = 0.001)]
     learning_rate: f32,
     #[arg(long, default_value_t = 0.55)]
@@ -128,6 +141,8 @@ struct ArenaRunConfig {
     progress_actions: usize,
     search: SearchConfig,
     inference_batch_size: usize,
+    inference_memory_budget_bytes: usize,
+    network_config: NetworkConfig,
     max_actions: usize,
     seed: u64,
     training_steps: u64,
@@ -145,6 +160,8 @@ struct InferenceRequest {
 #[derive(Clone)]
 struct BatchingEvaluator {
     requests: SyncSender<InferenceRequest>,
+    network_config: NetworkConfig,
+    memory_budget_bytes: usize,
 }
 
 enum FittingDevice {
@@ -168,6 +185,13 @@ fn run() -> Result<(), Box<dyn Error>> {
         return Err(
             "--mcts-batch-size and --inference-batch-size must be greater than zero".into(),
         );
+    }
+    if arguments.inference_memory_budget_mib == 0
+        || arguments.training_memory_budget_mib == 0
+        || arguments.reconstruction_memory_budget_mib == 0
+        || arguments.training_examples == 0
+    {
+        return Err("memory budgets and --training-examples must be greater than zero".into());
     }
     let pool = ThreadPoolBuilder::new()
         .num_threads(arguments.threads)
@@ -251,9 +275,15 @@ fn train(arguments: &Arguments, pool: &ThreadPool) -> Result<(), Box<dyn Error>>
         let mut decisive = 0;
         let mut truncated = 0;
         let generated = match resolved_inference_device(arguments) {
-            InferenceDevice::Cpu | InferenceDevice::Auto => {
-                generate_self_play(arguments, &best, search, iteration, replay.len(), pool)
-            }
+            InferenceDevice::Cpu | InferenceDevice::Auto => generate_self_play(
+                arguments,
+                &best,
+                network_config,
+                search,
+                iteration,
+                replay.len(),
+                pool,
+            ),
             InferenceDevice::Vulkan => {
                 let device = vulkan_device(fitting_device.as_ref())?;
                 let evaluator = device.evaluator(&best)?;
@@ -261,7 +291,15 @@ fn train(arguments: &Arguments, pool: &ThreadPool) -> Result<(), Box<dyn Error>>
                     "self-play inference confirmed: full policy/value probe passed on Vulkan adapter '{}'",
                     device.info().name
                 );
-                generate_self_play(arguments, &evaluator, search, iteration, replay.len(), pool)
+                generate_self_play(
+                    arguments,
+                    &evaluator,
+                    network_config,
+                    search,
+                    iteration,
+                    replay.len(),
+                    pool,
+                )
             }
         };
         for generated in generated {
@@ -327,13 +365,17 @@ fn prepare_fitting_device(arguments: &Arguments) -> Result<Option<FittingDevice>
         );
     }
     println!(
-        "trainer startup: work_dir={}, model={:?}, fitting_device={:?}, inference_device={inference_device:?}, threads={}, mcts_batch={}, inference_batch={}",
+        "trainer startup: work_dir={}, model={:?}, fitting_device={:?}, inference_device={inference_device:?}, threads={}, mcts_batch={}, inference_batch={}, inference_memory={} MiB, training_memory={} MiB, reconstruction_memory={} MiB, training_examples={}",
         arguments.work_dir.display(),
         arguments.model_size,
         arguments.training_device,
         arguments.threads,
         arguments.mcts_batch_size,
-        arguments.inference_batch_size
+        arguments.inference_batch_size,
+        arguments.inference_memory_budget_mib,
+        arguments.training_memory_budget_mib,
+        arguments.reconstruction_memory_budget_mib,
+        arguments.training_examples
     );
     if !arguments.fit_only && arguments.threads > arguments.games.max(1) {
         println!(
@@ -436,6 +478,8 @@ fn evaluate_and_maybe_promote(
         progress_actions: arguments.arena_progress_actions,
         search,
         inference_batch_size: arguments.inference_batch_size,
+        inference_memory_budget_bytes: mib_to_bytes(arguments.inference_memory_budget_mib),
+        network_config: candidate.config(),
         max_actions: arguments.max_actions,
         seed: arguments.seed,
         training_steps: candidate.training_steps(),
@@ -497,29 +541,64 @@ fn fit_candidate(
     rng: &mut ChaCha8Rng,
 ) -> Result<(), Box<dyn Error>> {
     let reconstruction_started = Instant::now();
-    let examples = replay.examples()?;
+    let sample = replay.sample_examples(
+        arguments.training_examples,
+        mib_to_bytes(arguments.reconstruction_memory_budget_mib),
+        rng,
+    )?;
+    let examples = sample.examples;
     println!(
-        "reconstructed {} training positions in {:.2?}",
+        "reconstructed {} sampled training positions in {:.2?}: estimated_host_memory={} MiB, skipped_for_memory={}",
         examples.len(),
-        reconstruction_started.elapsed()
+        reconstruction_started.elapsed(),
+        bytes_to_mib_ceil(sample.estimated_bytes),
+        sample.skipped_for_memory
+    );
+    if examples.is_empty() {
+        return Err("the replay sample produced no training positions".into());
+    }
+    let largest_position = examples
+        .iter()
+        .map(|example| {
+            estimate_training_batch_memory(
+                std::slice::from_ref(&example.position),
+                candidate.config(),
+            )
+        })
+        .max_by_key(|estimate| estimate.bytes)
+        .expect("non-empty replay sample");
+    println!(
+        "largest sampled position: boards={}, actions={}, estimated_training_memory={} MiB",
+        largest_position.max_boards,
+        largest_position.max_actions,
+        bytes_to_mib_ceil(largest_position.bytes)
     );
     let fit_started = Instant::now();
     let train_config = TrainConfig {
         epochs: arguments.epochs,
         batch_size: arguments.batch_size,
         batch_token_budget: arguments.batch_token_budget,
+        batch_memory_budget_bytes: mib_to_bytes(arguments.training_memory_budget_mib),
         learning_rate: arguments.learning_rate,
         ..TrainConfig::default()
     };
     match fitting_device {
-        FittingDevice::Cpu => println!("starting fitting on CPU (Burn ndarray)"),
+        FittingDevice::Cpu => println!(
+            "starting fitting on CPU (Burn ndarray): batch_size<={}, padded_tokens<={}, dynamic_memory<={} MiB",
+            train_config.batch_size,
+            train_config.batch_token_budget,
+            arguments.training_memory_budget_mib
+        ),
         FittingDevice::Vulkan(device) => println!(
-            "starting GPU fitting on Vulkan adapter '{}'",
-            device.info().name
+            "starting GPU fitting on Vulkan adapter '{}': batch_size<={}, padded_tokens<={}, dynamic_memory<={} MiB",
+            device.info().name,
+            train_config.batch_size,
+            train_config.batch_token_budget,
+            arguments.training_memory_budget_mib
         ),
     }
     let metrics = match fitting_device {
-        FittingDevice::Cpu => candidate.train(&examples, train_config, rng),
+        FittingDevice::Cpu => candidate.train(&examples, train_config, rng)?,
         FittingDevice::Vulkan(device) => {
             candidate.train_vulkan(device, &examples, train_config, rng)?
         }
@@ -578,10 +657,14 @@ fn evaluate<E: PolicyValueEvaluator + ?Sized>(
     let results = with_batched_evaluator(
         candidate,
         config.inference_batch_size,
+        config.network_config,
+        config.inference_memory_budget_bytes,
         |candidate_evaluator| {
             with_batched_evaluator(
                 incumbent,
                 config.inference_batch_size,
+                config.network_config,
+                config.inference_memory_budget_bytes,
                 |incumbent_evaluator| {
                     pool.install(|| {
                         schedule
@@ -662,6 +745,7 @@ fn evaluate<E: PolicyValueEvaluator + ?Sized>(
 fn generate_self_play<E: PolicyValueEvaluator + ?Sized>(
     arguments: &Arguments,
     best: &E,
+    network_config: NetworkConfig,
     search: SearchConfig,
     iteration: usize,
     replay_len: usize,
@@ -674,49 +758,55 @@ fn generate_self_play<E: PolicyValueEvaluator + ?Sized>(
         pool.current_num_threads()
     );
     let completed = Mutex::new(0_usize);
-    with_batched_evaluator(best, arguments.inference_batch_size, |evaluator| {
-        pool.install(|| {
-            (0..arguments.games)
-                .into_par_iter()
-                .map(|game_index| {
-                    let ruleset = selected_ruleset(arguments.ruleset, iteration + game_index);
-                    let mut rng = ChaCha8Rng::seed_from_u64(derived_seed(
-                        arguments.seed,
-                        SELF_PLAY_SEED,
-                        usize_to_u64(iteration) ^ usize_to_u64(replay_len).rotate_left(32),
-                        usize_to_u64(game_index),
-                    ));
-                    let game = play_self_play_game(
-                    evaluator,
-                    ruleset,
-                    SelfPlayConfig {
-                        search,
-                        max_actions: arguments.max_actions,
-                        ..SelfPlayConfig::default()
-                        },
-                        &mut rng,
-                    );
-                    {
-                        let mut finished = completed
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner);
-                        *finished += 1;
-                        println!(
-                            "iteration {} self-play game {}/{} complete ({ruleset}): examples={}, decisive={}, truncated={} ({finished}/{} finished)",
-                            iteration + 1,
-                            game_index + 1,
-                            arguments.games,
-                            game.steps.len(),
-                            usize::from(game.outcome.is_some()),
-                            usize::from(game.truncated),
-                            arguments.games
+    with_batched_evaluator(
+        best,
+        arguments.inference_batch_size,
+        network_config,
+        mib_to_bytes(arguments.inference_memory_budget_mib),
+        |evaluator| {
+            pool.install(|| {
+                (0..arguments.games)
+                    .into_par_iter()
+                    .map(|game_index| {
+                        let ruleset = selected_ruleset(arguments.ruleset, iteration + game_index);
+                        let mut rng = ChaCha8Rng::seed_from_u64(derived_seed(
+                            arguments.seed,
+                            SELF_PLAY_SEED,
+                            usize_to_u64(iteration) ^ usize_to_u64(replay_len).rotate_left(32),
+                            usize_to_u64(game_index),
+                        ));
+                        let game = play_self_play_game(
+                            evaluator,
+                            ruleset,
+                            SelfPlayConfig {
+                                search,
+                                max_actions: arguments.max_actions,
+                                ..SelfPlayConfig::default()
+                            },
+                            &mut rng,
                         );
-                    }
-                    GeneratedGame { game }
-                })
-                .collect()
-        })
-    })
+                        {
+                            let mut finished = completed
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            *finished += 1;
+                            println!(
+                                "iteration {} self-play game {}/{} complete ({ruleset}): examples={}, decisive={}, truncated={} ({finished}/{} finished)",
+                                iteration + 1,
+                                game_index + 1,
+                                arguments.games,
+                                game.steps.len(),
+                                usize::from(game.outcome.is_some()),
+                                usize::from(game.truncated),
+                                arguments.games
+                            );
+                        }
+                        GeneratedGame { game }
+                    })
+                    .collect()
+            })
+        },
+    )
 }
 
 impl PolicyValueEvaluator for BatchingEvaluator {
@@ -730,29 +820,67 @@ impl PolicyValueEvaluator for BatchingEvaluator {
         if positions.is_empty() {
             return Vec::new();
         }
-        let (response, results) = mpsc::sync_channel(1);
-        self.requests
-            .send(InferenceRequest {
-                positions: positions.to_vec(),
-                response,
-            })
-            .expect("inference coordinator remains available");
-        results
-            .recv()
-            .expect("inference coordinator returns a result")
+        let mut predictions = Vec::with_capacity(positions.len());
+        let mut start = 0;
+        while start < positions.len() {
+            let mut end = start + 1;
+            let single =
+                estimate_inference_batch_memory(&positions[start..end], self.network_config);
+            assert!(
+                single.bytes <= self.memory_budget_bytes,
+                "one inference position exceeds the configured memory budget: boards={}, actions={}, estimated={} MiB, budget={} MiB",
+                single.max_boards,
+                single.max_actions,
+                bytes_to_mib_ceil(single.bytes),
+                bytes_to_mib_ceil(self.memory_budget_bytes)
+            );
+            while end < positions.len()
+                && estimate_inference_batch_memory(&positions[start..=end], self.network_config)
+                    .bytes
+                    <= self.memory_budget_bytes
+            {
+                end += 1;
+            }
+            let (response, results) = mpsc::sync_channel(1);
+            self.requests
+                .send(InferenceRequest {
+                    positions: positions[start..end].to_vec(),
+                    response,
+                })
+                .expect("inference coordinator remains available");
+            predictions.extend(
+                results
+                    .recv()
+                    .expect("inference coordinator returns a result"),
+            );
+            start = end;
+        }
+        predictions
     }
 }
 
 fn with_batched_evaluator<E: PolicyValueEvaluator + ?Sized, R>(
     model: &E,
     target_batch_size: usize,
+    network_config: NetworkConfig,
+    memory_budget_bytes: usize,
     operation: impl FnOnce(&BatchingEvaluator) -> R,
 ) -> R {
     std::thread::scope(|scope| {
         let (requests, receiver) = mpsc::sync_channel(256);
-        let evaluator = BatchingEvaluator { requests };
+        let evaluator = BatchingEvaluator {
+            requests,
+            network_config,
+            memory_budget_bytes,
+        };
         let coordinator = scope.spawn(move || {
-            run_inference_coordinator(model, &receiver, target_batch_size.max(1));
+            run_inference_coordinator(
+                model,
+                &receiver,
+                target_batch_size.max(1),
+                network_config,
+                memory_budget_bytes,
+            );
         });
         let result = operation(&evaluator);
         drop(evaluator);
@@ -767,14 +895,42 @@ fn run_inference_coordinator<E: PolicyValueEvaluator + ?Sized>(
     model: &E,
     receiver: &Receiver<InferenceRequest>,
     target_batch_size: usize,
+    network_config: NetworkConfig,
+    memory_budget_bytes: usize,
 ) {
-    while let Ok(first) = receiver.recv() {
+    let mut pending = None;
+    loop {
+        let first = match pending.take() {
+            Some(request) => request,
+            None => match receiver.recv() {
+                Ok(request) => request,
+                Err(_) => break,
+            },
+        };
         let mut count = first.positions.len();
+        let (mut max_boards, mut max_actions) = request_dimensions(&first);
         let mut requests = vec![first];
         while count < target_batch_size {
             match receiver.recv_timeout(Duration::from_micros(200)) {
                 Ok(request) => {
-                    count += request.positions.len();
+                    let (request_boards, request_actions) = request_dimensions(&request);
+                    let candidate_count = count.saturating_add(request.positions.len());
+                    let candidate_boards = max_boards.max(request_boards);
+                    let candidate_actions = max_actions.max(request_actions);
+                    let estimate = estimate_batch_memory_from_shape(
+                        candidate_count,
+                        candidate_boards,
+                        candidate_actions,
+                        network_config,
+                        false,
+                    );
+                    if estimate.bytes > memory_budget_bytes {
+                        pending = Some(request);
+                        break;
+                    }
+                    count = candidate_count;
+                    max_boards = candidate_boards;
+                    max_actions = candidate_actions;
                     requests.push(request);
                 }
                 Err(mpsc::RecvTimeoutError::Timeout | mpsc::RecvTimeoutError::Disconnected) => {
@@ -801,8 +957,28 @@ fn run_inference_coordinator<E: PolicyValueEvaluator + ?Sized>(
     }
 }
 
+fn request_dimensions(request: &InferenceRequest) -> (usize, usize) {
+    request
+        .positions
+        .iter()
+        .fold((1, 1), |(boards, actions), position| {
+            (
+                boards.max(position.boards.len()),
+                actions.max(position.actions.len()),
+            )
+        })
+}
+
 fn default_threads() -> usize {
     std::thread::available_parallelism().map_or(1, std::num::NonZero::get)
+}
+
+const fn mib_to_bytes(mib: usize) -> usize {
+    mib.saturating_mul(1024 * 1024)
+}
+
+const fn bytes_to_mib_ceil(bytes: usize) -> usize {
+    bytes.saturating_add(1024 * 1024 - 1) / (1024 * 1024)
 }
 
 const fn derived_seed(base: u64, phase: u64, sequence: u64, index: u64) -> u64 {
@@ -893,6 +1069,10 @@ mod tests {
         assert_eq!(arguments.batch_token_budget, 262_144);
         assert_eq!(arguments.mcts_batch_size, 8);
         assert_eq!(arguments.inference_batch_size, 64);
+        assert_eq!(arguments.inference_memory_budget_mib, 1024);
+        assert_eq!(arguments.training_memory_budget_mib, 4096);
+        assert_eq!(arguments.reconstruction_memory_budget_mib, 4096);
+        assert_eq!(arguments.training_examples, 20_000);
     }
 
     #[test]
@@ -941,7 +1121,13 @@ mod tests {
         drop(requests);
         let evaluator = CountingEvaluator::default();
 
-        run_inference_coordinator(&evaluator, &receiver, 64);
+        run_inference_coordinator(
+            &evaluator,
+            &receiver,
+            64,
+            NetworkConfig::tiny(),
+            mib_to_bytes(64),
+        );
 
         assert_eq!(evaluator.0.load(Ordering::Relaxed), 3);
         assert!(
@@ -949,6 +1135,22 @@ mod tests {
                 .into_iter()
                 .all(|result| result.recv().unwrap().len() == 1)
         );
+    }
+
+    #[test]
+    fn inference_memory_budget_splits_one_large_request() {
+        let game = Game::new(Ruleset::Classic);
+        let position = encode(&game, &game.legal_actions());
+        let config = NetworkConfig::tiny();
+        let one = estimate_inference_batch_memory(std::slice::from_ref(&position), config);
+        let evaluator = CountingEvaluator::default();
+
+        let predictions = with_batched_evaluator(&evaluator, 64, config, one.bytes, |batched| {
+            batched.predict_batch(&[position.clone(), position.clone(), position])
+        });
+
+        assert_eq!(predictions.len(), 3);
+        assert_eq!(evaluator.0.load(Ordering::Relaxed), 1);
     }
 
     #[test]

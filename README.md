@@ -157,8 +157,10 @@ cargo run --release -p huginn-trainer -- \
 
 Independent self-play and arena games run concurrently. MCTS evaluates eight
 selected leaves per request by default, and the trainer merges requests from
-concurrent games into batches of up to 64 positions. Use
-`--mcts-batch-size` and `--inference-batch-size` to tune those limits. The
+concurrent games into batches of up to 64 positions. Inference batches are also
+limited by a conservative padded-tensor estimate (1 GiB by default). Use
+`--mcts-batch-size`, `--inference-batch-size`, and
+`--inference-memory-budget-mib` to tune those limits. The
 default worker count is the logical CPU availability reported by the operating
 system through Rust's `available_parallelism()`; pass `--threads N` to override
 it. `--threads` is capacity rather than a promise of occupancy: with the
@@ -168,7 +170,11 @@ this distinction explicitly.
 
 Each iteration generates noisy self-play games, appends them to a bounded replay
 window, trains a candidate, and evaluates it against the incumbent with colours
-alternated. A candidate is promoted to `best-v2.json` only when it reaches the
+alternated. The compact replay can retain 100,000 positions, but fitting
+randomly samples at most 20,000 per iteration and caps their expanded host-side
+representation at an estimated 4 GiB. Replay compression and decompression are
+streamed to avoid duplicate whole-file buffers. A candidate is promoted to
+`best-v2.json` only when it reaches the
 configured arena score. This JSON checkpoint embeds a backend-neutral,
 full-precision Burn record. The server loads the conventional checkpoint paths
 automatically; use `HUGINN_AZ_MODEL` to override Muninn's path,
@@ -229,9 +235,32 @@ and inference backends separately and never silently changes Vulkan to CPU.
 During training, messages beginning `self-play inference confirmed` and
 `arena inference confirmed` name the adapter after a full policy/value probe
 and synchronized readback have succeeded on it.
+
 To fit an existing replay immediately without generating games or running an
-arena, add `--fit-only`. The default `--batch-token-budget 262144` bounds padded
-board and action work; lower it if the driver reports an out-of-memory error.
+arena, add `--fit-only`. Training positions are grouped into similarly shaped
+buckets before batching. Both `--batch-token-budget 262144` and the default
+`--training-memory-budget-mib 4096` apply to the actual padded batch dimensions,
+not the sum of the unpadded positions. An individual position that exceeds the
+budget is rejected before Burn allocates it, with its board count, action count,
+estimate, and configured budget in the error.
+
+The memory limits control dynamic tensor and expanded-replay estimates; Vulkan
+driver, shader, model, and allocator overhead sit outside them. For the 24 GB
+RX 7900 XTX and roughly 32 GB of free system memory, the defaults intentionally
+leave substantial headroom. If another GPU workload is also active, reduce the
+limits without changing the replay or checkpoint:
+
+```powershell
+.\huginn-trainer.exe --work-dir models/training-gpu --ruleset both `
+  --training-device vulkan --model-size large `
+  --training-memory-budget-mib 512 --inference-memory-budget-mib 256 `
+  --reconstruction-memory-budget-mib 1024 --training-examples 10000
+```
+
+Startup logs the memory, sample, and batch limits. Before fitting, the trainer
+reports the sampled host-memory estimate and the largest position's board/action
+dimensions. A Vulkan panic or out-of-memory message is surfaced as
+`Vulkan training failed` instead of silently falling back to CPU.
 
 Version-1 `best.json` and `replay.json` files are left untouched because their
 hashed inputs and flat network are not compatible with this model. The trainer
