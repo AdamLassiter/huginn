@@ -15,6 +15,7 @@ use crate::{
 #[serde(rename_all = "lowercase")]
 pub enum ModelSize {
     Compact,
+    Balanced,
     #[default]
     Large,
 }
@@ -40,6 +41,24 @@ impl NetworkConfig {
             context_width: 128,
             action_width: 96,
             value_width: 64,
+            group_norm_groups: 8,
+        }
+    }
+
+    /// A GPU-oriented compromise between the bootstrap and full-size networks.
+    ///
+    /// The residual trunk performs roughly one quarter of the convolution work
+    /// of [`Self::large`] while retaining substantially more capacity than the
+    /// compact test/development preset.
+    #[must_use]
+    pub const fn balanced() -> Self {
+        Self {
+            channels: 40,
+            residual_blocks: 4,
+            board_embedding: 128,
+            context_width: 192,
+            action_width: 128,
+            value_width: 96,
             group_norm_groups: 8,
         }
     }
@@ -82,8 +101,28 @@ impl From<ModelSize> for NetworkConfig {
     fn from(value: ModelSize) -> Self {
         match value {
             ModelSize::Compact => Self::compact(),
+            ModelSize::Balanced => Self::balanced(),
             ModelSize::Large => Self::large(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn balanced_preset_sits_between_compact_and_large() {
+        let compact = NetworkConfig::compact();
+        let balanced = NetworkConfig::balanced();
+        let large = NetworkConfig::large();
+
+        assert!(compact.channels < balanced.channels);
+        assert!(balanced.channels < large.channels);
+        assert!(compact.residual_blocks < balanced.residual_blocks);
+        assert!(balanced.residual_blocks < large.residual_blocks);
+        assert!(compact.board_embedding < balanced.board_embedding);
+        assert!(balanced.board_embedding < large.board_embedding);
     }
 }
 

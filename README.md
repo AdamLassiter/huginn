@@ -155,6 +155,17 @@ cargo run --release -p huginn-trainer -- \
   --work-dir models/training --ruleset both
 ```
 
+`--model-size auto` is the default. It preserves the original large Muninn v1
+network for CPU training, so existing `models/training/best-v2.json`
+checkpoints remain compatible. (`v2` in that filename is the serialization
+format, not the Muninn model generation.) Vulkan/Huginn training resolves
+`auto` to the new balanced
+preset: 40 trunk channels, four residual blocks, and a 128-wide board
+embedding, compared with 64 channels, six blocks, and a 192-wide embedding in
+the large preset. Its residual trunk requires about 26% of the large preset's
+convolution work. `--model-size large` and `--model-size compact` remain
+available as explicit overrides.
+
 Independent self-play and arena games run concurrently. MCTS evaluates eight
 selected leaves per request by default, and the trainer merges requests from
 concurrent games into batches of up to 64 positions. Inference batches are also
@@ -204,8 +215,15 @@ directly from PowerShell without installing Rust:
 
 ```powershell
 .\huginn-trainer.exe --work-dir models/training-gpu --ruleset both `
-  --training-device vulkan --model-size large
+  --training-device vulkan
 ```
+
+The command reports `model=Auto (resolved=Balanced)` at startup. A checkpoint
+created with `--model-size large` cannot be resized in place. When switching an
+existing GPU work directory, remove its `best-v2.json` and `candidate-v2.json`
+and start again; `replay-v2.bin.zst` is architecture-independent and may be
+kept. CPU/Muninn work directories continue to resolve to the original large
+model.
 
 The trainer initializes and verifies Vulkan before beginning self-play. With
 the default `--inference-device auto`, selecting `--training-device vulkan`
@@ -252,7 +270,7 @@ limits without changing the replay or checkpoint:
 
 ```powershell
 .\huginn-trainer.exe --work-dir models/training-gpu --ruleset both `
-  --training-device vulkan --model-size large `
+  --training-device vulkan `
   --training-memory-budget-mib 512 --inference-memory-budget-mib 256 `
   --reconstruction-memory-budget-mib 1024 --training-examples 10000
 ```

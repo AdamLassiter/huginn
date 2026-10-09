@@ -847,6 +847,8 @@ fn train_backend<AB: AutodiffBackend>(
     let mut order = (0..examples.len()).collect::<Vec<_>>();
     let mut random = rand::rngs::StdRng::seed_from_u64(seed);
     let mut metrics = TrainMetrics::default();
+    let mut policy_loss_total: Option<Tensor<AB, 1>> = None;
+    let mut value_loss_total: Option<Tensor<AB, 1>> = None;
     let mut updates = 0_u64;
     for _ in 0..config.epochs {
         order.shuffle(&mut random);
@@ -888,8 +890,14 @@ fn train_backend<AB: AutodiffBackend>(
                 (targets * log_softmax(output.logits, 1)).sum().neg() / selected.len() as f32;
             let value_loss = (output.value - values).powf_scalar(2.0).mean();
             let loss = policy_loss.clone() + value_loss.clone();
-            metrics.policy_loss += scalar(&policy_loss) * selected.len() as f32;
-            metrics.value_loss += scalar(&value_loss) * selected.len() as f32;
+            let example_count = selected.len() as f32;
+            let policy_metric = policy_loss.detach() * example_count;
+            let value_metric = value_loss.detach() * example_count;
+            policy_loss_total = Some(
+                policy_loss_total.map_or(policy_metric.clone(), |total| total + policy_metric),
+            );
+            value_loss_total =
+                Some(value_loss_total.map_or(value_metric.clone(), |total| total + value_metric));
             metrics.examples += selected.len();
             let gradients = GradientsParams::from_grads(loss.backward(), &model);
             model = optimizer.step(f64::from(config.learning_rate), model, gradients);
@@ -898,8 +906,13 @@ fn train_backend<AB: AutodiffBackend>(
         }
     }
     if metrics.examples > 0 {
-        metrics.policy_loss /= metrics.examples as f32;
-        metrics.value_loss /= metrics.examples as f32;
+        // Reading a Vulkan tensor back to the host synchronizes the device. Keep
+        // metric accumulation on-device and perform only these two readbacks for
+        // the whole fit instead of two blocking readbacks after every batch.
+        metrics.policy_loss = scalar(&policy_loss_total.expect("training produced policy loss"))
+            / metrics.examples as f32;
+        metrics.value_loss = scalar(&value_loss_total.expect("training produced value loss"))
+            / metrics.examples as f32;
     }
     Ok((model.valid(), metrics, updates))
 }

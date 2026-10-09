@@ -42,19 +42,13 @@ enum InferenceDevice {
     Vulkan,
 }
 
-#[derive(Clone, Copy, Debug, ValueEnum)]
+#[derive(Clone, Copy, Debug, ValueEnum, PartialEq, Eq)]
 enum ModelSizeArgument {
+    /// Large on CPU (Muninn), balanced on Vulkan (Huginn).
+    Auto,
     Compact,
+    Balanced,
     Large,
-}
-
-impl From<ModelSizeArgument> for ModelSize {
-    fn from(value: ModelSizeArgument) -> Self {
-        match value {
-            ModelSizeArgument::Compact => Self::Compact,
-            ModelSizeArgument::Large => Self::Large,
-        }
-    }
 }
 
 #[derive(Debug, Parser)]
@@ -117,7 +111,8 @@ struct Arguments {
     learning_rate: f32,
     #[arg(long, default_value_t = 0.55)]
     promotion_score: f32,
-    #[arg(long, value_enum, default_value_t = ModelSizeArgument::Large)]
+    /// Network preset. Auto preserves the large CPU model and uses balanced for Vulkan.
+    #[arg(long, value_enum, default_value_t = ModelSizeArgument::Auto)]
     model_size: ModelSizeArgument,
     /// Backend used for network fitting.
     #[arg(long, value_enum, default_value_t = TrainingDevice::Cpu)]
@@ -212,7 +207,7 @@ fn train(arguments: &Arguments, pool: &ThreadPool) -> Result<(), Box<dyn Error>>
     let candidate_path = arguments.work_dir.join("candidate-v2.json");
     let replay_path = arguments.work_dir.join("replay-v2.bin.zst");
     warn_about_v1_files(&arguments.work_dir, &best_path, &replay_path);
-    let network_config = NetworkConfig::from(ModelSize::from(arguments.model_size));
+    let network_config = NetworkConfig::from(resolved_model_size(arguments));
     let mut best = load_or_initialize(&best_path, network_config, &mut rng)?;
     let search = SearchConfig {
         simulations: arguments.simulations,
@@ -364,8 +359,9 @@ fn prepare_fitting_device(arguments: &Arguments) -> Result<Option<FittingDevice>
                 .into(),
         );
     }
+    let resolved_model = resolved_model_size(arguments);
     println!(
-        "trainer startup: work_dir={}, model={:?}, fitting_device={:?}, inference_device={inference_device:?}, threads={}, mcts_batch={}, inference_batch={}, inference_memory={} MiB, training_memory={} MiB, reconstruction_memory={} MiB, training_examples={}",
+        "trainer startup: work_dir={}, model={:?} (resolved={resolved_model:?}), fitting_device={:?}, inference_device={inference_device:?}, threads={}, mcts_batch={}, inference_batch={}, inference_memory={} MiB, training_memory={} MiB, reconstruction_memory={} MiB, training_examples={}",
         arguments.work_dir.display(),
         arguments.model_size,
         arguments.training_device,
@@ -400,6 +396,18 @@ fn prepare_fitting_device(arguments: &Arguments) -> Result<Option<FittingDevice>
         }
     }
     Ok(fitting_device)
+}
+
+const fn resolved_model_size(arguments: &Arguments) -> ModelSize {
+    match arguments.model_size {
+        ModelSizeArgument::Auto => match arguments.training_device {
+            TrainingDevice::Cpu => ModelSize::Large,
+            TrainingDevice::Vulkan => ModelSize::Balanced,
+        },
+        ModelSizeArgument::Compact => ModelSize::Compact,
+        ModelSizeArgument::Balanced => ModelSize::Balanced,
+        ModelSizeArgument::Large => ModelSize::Large,
+    }
 }
 
 const fn resolved_inference_device(arguments: &Arguments) -> InferenceDevice {
@@ -1065,7 +1073,8 @@ mod tests {
         assert_eq!(resolved_inference_device(&arguments), InferenceDevice::Cpu);
         assert_eq!(arguments.gpu_index, 0);
         assert!(!arguments.check_training_device);
-        assert!(matches!(arguments.model_size, ModelSizeArgument::Large));
+        assert_eq!(arguments.model_size, ModelSizeArgument::Auto);
+        assert_eq!(resolved_model_size(&arguments), ModelSize::Large);
         assert_eq!(arguments.batch_token_budget, 262_144);
         assert_eq!(arguments.mcts_batch_size, 8);
         assert_eq!(arguments.inference_batch_size, 64);
@@ -1087,12 +1096,27 @@ mod tests {
         ])
         .expect("arguments");
         assert!(matches!(arguments.training_device, TrainingDevice::Vulkan));
+        assert_eq!(resolved_model_size(&arguments), ModelSize::Balanced);
         assert_eq!(
             resolved_inference_device(&arguments),
             InferenceDevice::Vulkan
         );
         assert_eq!(arguments.gpu_index, 2);
         assert!(arguments.check_training_device);
+    }
+
+    #[test]
+    fn explicit_model_size_overrides_device_default() {
+        let arguments = Arguments::try_parse_from([
+            "trainer",
+            "--training-device",
+            "vulkan",
+            "--model-size",
+            "large",
+        ])
+        .expect("arguments");
+
+        assert_eq!(resolved_model_size(&arguments), ModelSize::Large);
     }
 
     #[test]

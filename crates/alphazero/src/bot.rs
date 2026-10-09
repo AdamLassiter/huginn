@@ -41,7 +41,7 @@ impl AlphaZeroBot {
 }
 
 macro_rules! define_alpha_zero_bot {
-    ($name:ident, $username:literal, $display_name:literal) => {
+    ($name:ident, $username:literal, $display_name:literal, $bootstrap_config:expr) => {
         pub struct $name(AlphaZeroBot);
 
         impl $name {
@@ -67,7 +67,7 @@ macro_rules! define_alpha_zero_bot {
             /// Creates an untrained network, useful only as a fallback.
             #[must_use]
             pub fn bootstrap(search: SearchConfig, seed: u64) -> Self {
-                Self::bootstrap_with_config(search, seed, NetworkConfig::default())
+                Self::bootstrap_with_config(search, seed, $bootstrap_config)
             }
 
             #[doc(hidden)]
@@ -78,6 +78,11 @@ macro_rules! define_alpha_zero_bot {
                 config: NetworkConfig,
             ) -> Self {
                 Self(AlphaZeroBot::bootstrap(search, seed, config))
+            }
+
+            #[cfg(test)]
+            fn network_config(&self) -> NetworkConfig {
+                self.0.model.config()
             }
         }
 
@@ -96,8 +101,18 @@ macro_rules! define_alpha_zero_bot {
     };
 }
 
-define_alpha_zero_bot!(MuninnBot, "bot-muninn", "Muninn (CPU AlphaZero)");
-define_alpha_zero_bot!(HuginnBot, "bot-huginn", "Huginn (GPU-trained AlphaZero)");
+define_alpha_zero_bot!(
+    MuninnBot,
+    "bot-muninn",
+    "Muninn (CPU AlphaZero)",
+    NetworkConfig::large()
+);
+define_alpha_zero_bot!(
+    HuginnBot,
+    "bot-huginn",
+    "Huginn (GPU-trained AlphaZero)",
+    NetworkConfig::balanced()
+);
 
 #[cfg(test)]
 mod tests {
@@ -126,5 +141,19 @@ mod tests {
             let mut next = game.clone();
             next.apply_action(action).expect("legal bot action");
         }
+    }
+
+    #[test]
+    fn named_bootstraps_use_their_training_architectures() {
+        let search = SearchConfig::default();
+
+        assert_eq!(
+            MuninnBot::bootstrap(search, 31).network_config(),
+            NetworkConfig::large()
+        );
+        assert_eq!(
+            HuginnBot::bootstrap(search, 37).network_config(),
+            NetworkConfig::balanced()
+        );
     }
 }
