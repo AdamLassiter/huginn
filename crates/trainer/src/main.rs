@@ -52,6 +52,7 @@ enum ModelSizeArgument {
 }
 
 #[derive(Debug, Parser)]
+#[allow(clippy::struct_excessive_bools)]
 #[command(about = "Train Huginn's AlphaZero opponent entirely through self-play")]
 struct Arguments {
     #[arg(long, default_value = "models/training")]
@@ -76,6 +77,10 @@ struct Arguments {
     inference_memory_budget_mib: usize,
     #[arg(long, default_value_t = 4)]
     arena_games: usize,
+    /// Print arena starts, periodic action counts, and low-level device identifiers.
+    #[arg(long)]
+    verbose: bool,
+    /// Actions between arena updates when --verbose is enabled; zero disables updates.
     #[arg(long, default_value_t = 25)]
     arena_progress_actions: usize,
     /// Evaluate the saved candidate against best without generating or training.
@@ -133,6 +138,7 @@ struct Arguments {
 struct ArenaRunConfig {
     selection: RuleSelection,
     games: usize,
+    verbose: bool,
     progress_actions: usize,
     search: SearchConfig,
     inference_batch_size: usize,
@@ -162,6 +168,80 @@ struct BatchingEvaluator {
 enum FittingDevice {
     Cpu,
     Vulkan(VulkanTrainingDevice),
+}
+
+fn section(title: &str) {
+    println!("\n{title}");
+    println!("{}", "-".repeat(title.chars().count()));
+}
+
+fn field(label: &str, value: impl std::fmt::Display) {
+    println!("  {label:<20} {value}");
+}
+
+fn format_duration(duration: Duration) -> String {
+    let seconds = duration.as_secs_f64();
+    if seconds < 60.0 {
+        format!("{seconds:.1}s")
+    } else if seconds < 3_600.0 {
+        let minutes = duration.as_secs() / 60;
+        let remainder = duration
+            .checked_sub(Duration::from_secs(minutes * 60))
+            .expect("whole minutes cannot exceed the duration");
+        format!("{minutes}m {:.1}s", remainder.as_secs_f64())
+    } else {
+        let hours = duration.as_secs() / 3_600;
+        let minutes = duration.as_secs() / 60 % 60;
+        format!("{hours}h {minutes}m")
+    }
+}
+
+fn add_digit_separators(mut formatted: String) -> String {
+    let mut separator = formatted.len();
+    while separator > 3 {
+        separator -= 3;
+        formatted.insert(separator, ',');
+    }
+    formatted
+}
+
+fn format_count(value: usize) -> String {
+    add_digit_separators(value.to_string())
+}
+
+fn format_steps(value: u64) -> String {
+    add_digit_separators(value.to_string())
+}
+
+fn counted(value: usize, noun: &str) -> String {
+    format!(
+        "{} {noun}{}",
+        format_count(value),
+        if value == 1 { "" } else { "s" }
+    )
+}
+
+const fn training_device_label(device: TrainingDevice) -> &'static str {
+    match device {
+        TrainingDevice::Cpu => "CPU",
+        TrainingDevice::Vulkan => "Vulkan",
+    }
+}
+
+const fn inference_device_label(device: InferenceDevice) -> &'static str {
+    match device {
+        InferenceDevice::Auto => "automatic",
+        InferenceDevice::Cpu => "CPU",
+        InferenceDevice::Vulkan => "Vulkan",
+    }
+}
+
+const fn ruleset_label(selection: RuleSelection) -> &'static str {
+    match selection {
+        RuleSelection::Classic => "Classic Copenhagen",
+        RuleSelection::Multiverse => "5D Copenhagen",
+        RuleSelection::Both => "Classic + 5D Copenhagen",
+    }
 }
 
 fn main() {
@@ -199,7 +279,7 @@ fn run() -> Result<(), Box<dyn Error>> {
 fn train(arguments: &Arguments, pool: &ThreadPool) -> Result<(), Box<dyn Error>> {
     let fitting_device = prepare_fitting_device(arguments)?;
     if arguments.check_training_device {
-        println!("training device check complete; no self-play, fitting, or arena was run");
+        field("Status", "device check complete; training was not started");
         return Ok(());
     }
     let mut rng = ChaCha8Rng::seed_from_u64(arguments.seed);
@@ -266,6 +346,12 @@ fn train(arguments: &Arguments, pool: &ThreadPool) -> Result<(), Box<dyn Error>>
     }
 
     for iteration in 0..arguments.iterations {
+        let iteration_started = Instant::now();
+        section(&format!(
+            "Iteration {}/{} · Self-play",
+            iteration + 1,
+            arguments.iterations
+        ));
         let self_play_started = Instant::now();
         let mut decisive = 0;
         let mut truncated = 0;
@@ -282,9 +368,9 @@ fn train(arguments: &Arguments, pool: &ThreadPool) -> Result<(), Box<dyn Error>>
             InferenceDevice::Vulkan => {
                 let device = vulkan_device(fitting_device.as_ref())?;
                 let evaluator = device.evaluator(&best)?;
-                println!(
-                    "self-play inference confirmed: full policy/value probe passed on Vulkan adapter '{}'",
-                    device.info().name
+                field(
+                    "Inference probe",
+                    format!("passed · Vulkan · {}", device.info().name),
                 );
                 generate_self_play(
                     arguments,
@@ -302,14 +388,18 @@ fn train(arguments: &Arguments, pool: &ThreadPool) -> Result<(), Box<dyn Error>>
             truncated += usize::from(generated.game.truncated);
             replay.extend_game(generated.game, arguments.replay_capacity);
         }
-        println!(
-            "iteration {} self-play batch complete: replay={}, decisive={}, truncated={}",
-            iteration + 1,
-            replay.len(),
-            decisive,
-            truncated,
+        field(
+            "Self-play result",
+            format!(
+                "{} in replay · {decisive} decisive · {}",
+                counted(replay.len(), "position"),
+                counted(truncated, "action-limit draw")
+            ),
         );
-        println!("self-play time: {:.2?}", self_play_started.elapsed());
+        field(
+            "Self-play time",
+            format_duration(self_play_started.elapsed()),
+        );
         replay.save(&replay_path)?;
 
         let mut candidate = best.clone();
@@ -334,7 +424,11 @@ fn train(arguments: &Arguments, pool: &ThreadPool) -> Result<(), Box<dyn Error>>
             pool,
             fitting_device.as_ref(),
         )?;
-        println!("arena time: {:.2?}", arena_started.elapsed());
+        field("Arena time", format_duration(arena_started.elapsed()));
+        field(
+            "Iteration time",
+            format_duration(iteration_started.elapsed()),
+        );
     }
     Ok(())
 }
@@ -360,27 +454,69 @@ fn prepare_fitting_device(arguments: &Arguments) -> Result<Option<FittingDevice>
         );
     }
     let resolved_model = resolved_model_size(arguments);
-    println!(
-        "trainer startup: work_dir={}, model={:?} (resolved={resolved_model:?}), fitting_device={:?}, inference_device={inference_device:?}, threads={}, mcts_batch={}, inference_batch={}, inference_memory={} MiB, training_memory={} MiB, reconstruction_memory={} MiB, training_examples={}",
-        arguments.work_dir.display(),
-        arguments.model_size,
-        arguments.training_device,
-        arguments.threads,
-        arguments.mcts_batch_size,
-        arguments.inference_batch_size,
-        arguments.inference_memory_budget_mib,
-        arguments.training_memory_budget_mib,
-        arguments.reconstruction_memory_budget_mib,
-        arguments.training_examples
+    println!("Huginn Trainer");
+    println!("==============");
+    section("Configuration");
+    field("Work directory", arguments.work_dir.display());
+    field("Rules", ruleset_label(arguments.ruleset));
+    field(
+        "Model",
+        format!(
+            "{resolved_model:?} ({})",
+            if arguments.model_size == ModelSizeArgument::Auto {
+                "automatic"
+            } else {
+                "explicit"
+            }
+        ),
     );
-    if !arguments.fit_only && arguments.threads > arguments.games.max(1) {
-        println!(
-            "parallelism note: --threads={} is worker capacity, but {} self-play games provide at most {} simultaneous game tasks; batched inference is handled by a dedicated coordinator",
-            arguments.threads, arguments.games, arguments.games
-        );
-    }
+    field(
+        "Compute",
+        format!(
+            "{} fitting · {} inference",
+            training_device_label(arguments.training_device),
+            inference_device_label(inference_device)
+        ),
+    );
+    let worker_note = if !arguments.fit_only && arguments.threads > arguments.games.max(1) {
+        format!(
+            "{} (up to {} concurrent self-play games)",
+            arguments.threads, arguments.games
+        )
+    } else {
+        arguments.threads.to_string()
+    };
+    field("Workers", worker_note);
+    field(
+        "Search",
+        format!(
+            "{}/action · MCTS batch {} · inference batch {}",
+            counted(arguments.simulations, "simulation"),
+            format_count(arguments.mcts_batch_size),
+            format_count(arguments.inference_batch_size)
+        ),
+    );
+    field(
+        "Memory limits",
+        format!(
+            "inference {} MiB · fitting {} MiB · replay {} MiB",
+            arguments.inference_memory_budget_mib,
+            arguments.training_memory_budget_mib,
+            arguments.reconstruction_memory_budget_mib
+        ),
+    );
+    field(
+        "Training",
+        format!(
+            "{} sampled · {} · batch ≤ {}",
+            counted(arguments.training_examples, "position"),
+            counted(arguments.epochs, "epoch"),
+            format_count(arguments.batch_size)
+        ),
+    );
+    section("Compute device");
     let fitting_device = if arguments.arena_only && inference_device == InferenceDevice::Cpu {
-        println!("arena-only mode: no fitting device is initialized");
+        field("Fitting", "not initialized (CPU arena-only mode)");
         None
     } else {
         Some(initialize_fitting_device(arguments)?)
@@ -388,11 +524,11 @@ fn prepare_fitting_device(arguments: &Arguments) -> Result<Option<FittingDevice>
     if !arguments.fit_only && !arguments.check_training_device {
         match inference_device {
             InferenceDevice::Cpu | InferenceDevice::Auto => {
-                println!("inference backend confirmed: CPU (Burn ndarray)");
+                field("Inference", "CPU · Burn ndarray");
             }
-            InferenceDevice::Vulkan => println!(
-                "inference backend confirmed: Vulkan (self-play and arena will use the verified GPU)"
-            ),
+            InferenceDevice::Vulkan => {
+                field("Inference", "verified Vulkan GPU · self-play and arena");
+            }
         }
     }
     Ok(fitting_device)
@@ -434,38 +570,43 @@ fn vulkan_device(
 fn initialize_fitting_device(arguments: &Arguments) -> Result<FittingDevice, Box<dyn Error>> {
     match arguments.training_device {
         TrainingDevice::Cpu => {
-            println!("fitting backend confirmed: CPU (Burn ndarray)");
+            field("Fitting", "CPU · Burn ndarray");
             Ok(FittingDevice::Cpu)
         }
         TrainingDevice::Vulkan => {
-            println!(
-                "initializing Vulkan discrete GPU index {} (CPU/software fallback disabled)...",
-                arguments.gpu_index
+            field(
+                "Initializing",
+                format!("Vulkan discrete GPU {}…", arguments.gpu_index),
             );
             let device = VulkanTrainingDevice::initialize(arguments.gpu_index)?;
             let info = device.info();
-            println!(
-                "Vulkan GPU confirmed: adapter='{}', type={}, backend={}, index={}, vendor=0x{:04x}, device=0x{:04x}",
-                info.name,
-                info.device_type,
-                info.backend,
-                info.discrete_gpu_index,
-                info.vendor,
-                info.device
+            field("GPU", &info.name);
+            field(
+                "Driver",
+                format!(
+                    "{} · {}",
+                    info.driver,
+                    if info.driver_info.is_empty() {
+                        "version not reported"
+                    } else {
+                        &info.driver_info
+                    }
+                ),
             );
-            println!(
-                "Vulkan driver: '{}' ({})",
-                info.driver,
-                if info.driver_info.is_empty() {
-                    "no version reported"
-                } else {
-                    &info.driver_info
-                }
-            );
-            println!(
-                "Vulkan compute probe passed on '{}'; fitting will use this GPU",
-                info.name
-            );
+            if arguments.verbose {
+                field(
+                    "Device details",
+                    format!(
+                        "{} · {} · index {} · vendor 0x{:04x} · device 0x{:04x}",
+                        info.device_type,
+                        info.backend,
+                        info.discrete_gpu_index,
+                        info.vendor,
+                        info.device
+                    ),
+                );
+            }
+            field("Validation", "Vulkan compute probe passed");
             Ok(FittingDevice::Vulkan(device))
         }
     }
@@ -480,9 +621,11 @@ fn evaluate_and_maybe_promote(
     pool: &ThreadPool,
     fitting_device: Option<&FittingDevice>,
 ) -> Result<(), Box<dyn Error>> {
+    section("Arena");
     let config = ArenaRunConfig {
         selection: arguments.ruleset,
         games: arguments.arena_games,
+        verbose: arguments.verbose,
         progress_actions: arguments.arena_progress_actions,
         search,
         inference_batch_size: arguments.inference_batch_size,
@@ -498,18 +641,29 @@ fn evaluate_and_maybe_promote(
             let device = vulkan_device(fitting_device)?;
             let candidate_evaluator = device.evaluator(candidate)?;
             let incumbent_evaluator = device.evaluator(best)?;
-            println!(
-                "arena inference confirmed: full policy/value probes passed on Vulkan adapter '{}'",
-                device.info().name
+            field(
+                "Inference probe",
+                format!("passed · Vulkan · {}", device.info().name),
             );
             evaluate(&candidate_evaluator, &incumbent_evaluator, config, pool)
         }
     };
     let score = report.candidate_score();
     let promoted = arguments.arena_games == 0 || score >= arguments.promotion_score;
-    println!(
-        "arena: candidate={} incumbent={} draws={} score={score:.3} promoted={promoted}",
-        report.candidate_wins, report.incumbent_wins, report.draws
+    field(
+        "Match result",
+        format!(
+            "candidate {} · incumbent {} · draws {} · score {score:.3}",
+            report.candidate_wins, report.incumbent_wins, report.draws
+        ),
+    );
+    field(
+        "Decision",
+        if promoted {
+            "candidate promoted"
+        } else {
+            "incumbent retained"
+        },
     );
     if promoted {
         candidate.save(best_path)?;
@@ -548,6 +702,7 @@ fn fit_candidate(
     candidate: &mut PolicyValueNetwork,
     rng: &mut ChaCha8Rng,
 ) -> Result<(), Box<dyn Error>> {
+    section("Fitting");
     let reconstruction_started = Instant::now();
     let sample = replay.sample_examples(
         arguments.training_examples,
@@ -555,12 +710,15 @@ fn fit_candidate(
         rng,
     )?;
     let examples = sample.examples;
-    println!(
-        "reconstructed {} sampled training positions in {:.2?}: estimated_host_memory={} MiB, skipped_for_memory={}",
-        examples.len(),
-        reconstruction_started.elapsed(),
-        bytes_to_mib_ceil(sample.estimated_bytes),
-        sample.skipped_for_memory
+    field(
+        "Replay sample",
+        format!(
+            "{} · {} MiB host · {} · {} skipped",
+            counted(examples.len(), "position"),
+            bytes_to_mib_ceil(sample.estimated_bytes),
+            format_duration(reconstruction_started.elapsed()),
+            sample.skipped_for_memory
+        ),
     );
     if examples.is_empty() {
         return Err("the replay sample produced no training positions".into());
@@ -575,11 +733,14 @@ fn fit_candidate(
         })
         .max_by_key(|estimate| estimate.bytes)
         .expect("non-empty replay sample");
-    println!(
-        "largest sampled position: boards={}, actions={}, estimated_training_memory={} MiB",
-        largest_position.max_boards,
-        largest_position.max_actions,
-        bytes_to_mib_ceil(largest_position.bytes)
+    field(
+        "Largest position",
+        format!(
+            "{} · {} · ~{} MiB fitting memory",
+            counted(largest_position.max_boards, "board"),
+            counted(largest_position.max_actions, "action"),
+            bytes_to_mib_ceil(largest_position.bytes)
+        ),
     );
     let fit_started = Instant::now();
     let train_config = TrainConfig {
@@ -591,35 +752,38 @@ fn fit_candidate(
         ..TrainConfig::default()
     };
     match fitting_device {
-        FittingDevice::Cpu => println!(
-            "starting fitting on CPU (Burn ndarray): batch_size<={}, padded_tokens<={}, dynamic_memory<={} MiB",
-            train_config.batch_size,
-            train_config.batch_token_budget,
-            arguments.training_memory_budget_mib
-        ),
-        FittingDevice::Vulkan(device) => println!(
-            "starting GPU fitting on Vulkan adapter '{}': batch_size<={}, padded_tokens<={}, dynamic_memory<={} MiB",
-            device.info().name,
-            train_config.batch_size,
-            train_config.batch_token_budget,
-            arguments.training_memory_budget_mib
-        ),
+        FittingDevice::Cpu => field("Backend", "CPU · Burn ndarray"),
+        FittingDevice::Vulkan(device) => {
+            field("Backend", format!("Vulkan · {}", device.info().name));
+        }
     }
+    field(
+        "Batch limits",
+        format!(
+            "size {} · {} padded tokens · {} MiB dynamic memory",
+            format_count(train_config.batch_size),
+            format_count(train_config.batch_token_budget),
+            arguments.training_memory_budget_mib
+        ),
+    );
+    field("Status", "training…");
     let metrics = match fitting_device {
         FittingDevice::Cpu => candidate.train(&examples, train_config, rng)?,
         FittingDevice::Vulkan(device) => {
             candidate.train_vulkan(device, &examples, train_config, rng)?
         }
     };
-    println!(
-        "trained {} examples on {:?}: policy_loss={:.5}, value_loss={:.5}, steps={}, fit_time={:.2?}",
-        metrics.examples,
-        arguments.training_device,
-        metrics.policy_loss,
-        metrics.value_loss,
-        candidate.training_steps(),
-        fit_started.elapsed()
+    field(
+        "Training result",
+        format!(
+            "{} · {} total steps · policy loss {:.5} · value loss {:.5}",
+            counted(metrics.examples, "example"),
+            format_steps(candidate.training_steps()),
+            metrics.policy_loss,
+            metrics.value_loss
+        ),
     );
+    field("Fitting time", format_duration(fit_started.elapsed()));
     Ok(())
 }
 
@@ -642,6 +806,7 @@ fn warn_about_v1_files(work_dir: &Path, best_v2: &Path, replay_v2: &Path) {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn evaluate<E: PolicyValueEvaluator + ?Sized>(
     candidate: &E,
     incumbent: &E,
@@ -654,12 +819,15 @@ fn evaluate<E: PolicyValueEvaluator + ?Sized>(
             (selected_ruleset(config.selection, game_index), side)
         })
         .collect::<Vec<_>>();
-    println!(
-        "starting arena: {} games on {} threads, {} simulations/action, {} actions/game",
-        config.games,
-        pool.current_num_threads(),
-        config.search.simulations,
-        config.max_actions
+    field(
+        "Schedule",
+        format!(
+            "{} · {} · {}/action · {} limit",
+            counted(config.games, "game"),
+            counted(pool.current_num_threads(), "worker"),
+            counted(config.search.simulations, "simulation"),
+            counted(config.max_actions, "action")
+        ),
     );
     let completed = Mutex::new(0_usize);
     let results = with_batched_evaluator(
@@ -679,11 +847,13 @@ fn evaluate<E: PolicyValueEvaluator + ?Sized>(
                             .par_iter()
                             .enumerate()
                             .map(|(game_index, &(ruleset, candidate_side))| {
-                                println!(
-                                    "arena game {}/{} started ({ruleset}; candidate {candidate_side})",
-                                    game_index + 1,
-                                    config.games
-                                );
+                                if config.verbose {
+                                    println!(
+                                        "  [arena {}/{}] started · {ruleset} · candidate {candidate_side}",
+                                        game_index + 1,
+                                        config.games
+                                    );
+                                }
                                 let mut rng = ChaCha8Rng::seed_from_u64(derived_seed(
                                     config.seed,
                                     ARENA_SEED,
@@ -701,11 +871,12 @@ fn evaluate<E: PolicyValueEvaluator + ?Sized>(
                                     },
                                     &mut rng,
                                     |actions, _| {
-                                        if config.progress_actions > 0
+                                        if config.verbose
+                                            && config.progress_actions > 0
                                             && actions.is_multiple_of(config.progress_actions)
                                         {
                                             println!(
-                                                "arena game {}/{}: {actions} actions searched",
+                                                "  [arena {}/{}] {actions} actions searched",
                                                 game_index + 1,
                                                 config.games
                                             );
@@ -724,11 +895,10 @@ fn evaluate<E: PolicyValueEvaluator + ?Sized>(
                                         .unwrap_or_else(std::sync::PoisonError::into_inner);
                                     *finished += 1;
                                     println!(
-                                        "arena game {}/{} complete ({ruleset}; candidate {candidate_side}): actions={}, {description} ({finished}/{} finished)",
-                                        game_index + 1,
+                                        "  [{finished}/{}] arena game {} · {ruleset} · candidate {candidate_side} · {} · {description}",
                                         config.games,
-                                        result.actions,
-                                        config.games
+                                        game_index + 1,
+                                        counted(result.actions, "action"),
                                     );
                                 }
                                 (candidate_side, result.outcome)
@@ -759,11 +929,15 @@ fn generate_self_play<E: PolicyValueEvaluator + ?Sized>(
     replay_len: usize,
     pool: &ThreadPool,
 ) -> Vec<GeneratedGame> {
-    println!(
-        "iteration {} starting {} self-play games on {} threads",
-        iteration + 1,
-        arguments.games,
-        pool.current_num_threads()
+    field(
+        "Schedule",
+        format!(
+            "{} · {} · {}/action · {} limit",
+            counted(arguments.games, "game"),
+            counted(pool.current_num_threads(), "worker"),
+            counted(search.simulations, "simulation"),
+            counted(arguments.max_actions, "action")
+        ),
     );
     let completed = Mutex::new(0_usize);
     with_batched_evaluator(
@@ -798,15 +972,15 @@ fn generate_self_play<E: PolicyValueEvaluator + ?Sized>(
                                 .lock()
                                 .unwrap_or_else(std::sync::PoisonError::into_inner);
                             *finished += 1;
+                            let result = game.outcome.map_or_else(
+                                || "draw · action limit".to_owned(),
+                                |outcome| format!("{} won · {:?}", outcome.winner, outcome.reason),
+                            );
                             println!(
-                                "iteration {} self-play game {}/{} complete ({ruleset}): examples={}, decisive={}, truncated={} ({finished}/{} finished)",
-                                iteration + 1,
-                                game_index + 1,
+                                "  [{finished}/{}] game {} · {ruleset} · {} · {result}",
                                 arguments.games,
-                                game.steps.len(),
-                                usize::from(game.outcome.is_some()),
-                                usize::from(game.truncated),
-                                arguments.games
+                                game_index + 1,
+                                counted(game.steps.len(), "position"),
                             );
                         }
                         GeneratedGame { game }
@@ -1073,6 +1247,7 @@ mod tests {
         assert_eq!(resolved_inference_device(&arguments), InferenceDevice::Cpu);
         assert_eq!(arguments.gpu_index, 0);
         assert!(!arguments.check_training_device);
+        assert!(!arguments.verbose);
         assert_eq!(arguments.model_size, ModelSizeArgument::Auto);
         assert_eq!(resolved_model_size(&arguments), ModelSize::Large);
         assert_eq!(arguments.batch_token_budget, 262_144);
@@ -1082,6 +1257,16 @@ mod tests {
         assert_eq!(arguments.training_memory_budget_mib, 4096);
         assert_eq!(arguments.reconstruction_memory_budget_mib, 4096);
         assert_eq!(arguments.training_examples, 20_000);
+    }
+
+    #[test]
+    fn display_helpers_format_counts_and_durations_for_people() {
+        assert_eq!(format_count(20_000), "20,000");
+        assert_eq!(counted(1, "game"), "1 game");
+        assert_eq!(counted(8, "game"), "8 games");
+        assert_eq!(format_duration(Duration::from_millis(1_970)), "2.0s");
+        assert_eq!(format_duration(Duration::from_secs(159)), "2m 39.0s");
+        assert_eq!(format_duration(Duration::from_mins(125)), "2h 5m");
     }
 
     #[test]

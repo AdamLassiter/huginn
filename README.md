@@ -196,9 +196,14 @@ network. CPU-trained checkpoints conventionally live under `models/training`;
 Vulkan-trained checkpoints live under `models/training-gpu`, allowing both bots
 to coexist.
 
-Arena games report progress every 25 actions by default. If training is
-interrupted after `candidate-v2.json` is written, resume only its promotion match
-without repeating self-play:
+The default trainer output is grouped into configuration, device, self-play,
+fitting, and arena sections. It reports completed games but suppresses the
+per-game action counter to keep long arena runs readable. Add `--verbose` to
+show game starts, low-level Vulkan identifiers, and arena progress every 25
+actions; change that interval with `--arena-progress-actions` or set it to zero
+to disable the action updates. If training is interrupted after
+`candidate-v2.json` is written, resume only its promotion match without
+repeating self-play:
 
 ```sh
 cargo run --release -p huginn-trainer -- \
